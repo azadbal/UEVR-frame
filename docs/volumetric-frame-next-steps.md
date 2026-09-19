@@ -59,6 +59,10 @@ secondary scope, not part of the first alignment build.
 
 ## Parallel performance work
 
+The user confirmed prototype 03 works in FluidFlux. The tested implementation is
+preserved in commit `c473285` on `feature/volumetric-frame` and pushed to the user's
+fork. Geometry acceptance no longer blocks the first performance experiment.
+
 Astra investigates early per-eye aperture frusta and reduced scene dimensions
 while Luna implements shared geometry. Integrate optimization after that geometry
 is stable. The final mask remains necessary for exact oblique portal edges.
@@ -99,6 +103,15 @@ times and missed frames for identical portal output, optimization off/on. FPS
 alone can hide gains at the headset refresh cap. No measured speedup yet.
 
 ## Evidence and tracking
+
+Additional design investigations after the prototype 03 checkpoint:
+
+- [Coupled window/world resizing](volumetric-frame-resize-design.md): a proposed
+  size control for the apparent 3D scene and frame together, distinct from the
+  existing aperture-only width and the optional reference-FOV control. No runtime
+  implementation yet.
+- [Other-fork comparison](volumetric-frame-fork-comparison.md): source-backed
+  quality-of-life ideas from UEVR-6DOF-Window; no code imported.
 
 - [2D/UI source tracing](volumetric-frame-2d-research.md): historical findings;
   composition-preserving camera proposal is superseded by this spec.
