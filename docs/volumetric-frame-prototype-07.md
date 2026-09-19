@@ -1,4 +1,59 @@
-# Prototype 07: status, recovery and fixed Hogwarts comparison
+# Prototype 07: status, recovery and Hogwarts compatibility findings
+
+## Current Hogwarts guidance (supersedes the test below)
+
+The September 18 test failed compatibility/performance acceptance. Keep **Native
+Stereo Fix on** and **both experimental optimizations off** for Hogwarts. The
+user reports broken visuals and single-digit performance without the fix.
+Do not repeat the Native Stereo Fix-off benchmark below; it is retained as the
+historical test procedure. Supporting the fix's separate-eye rendering path is
+a prerequisite for further Hogwarts optimization tests.
+
+The surviving log covers 19:40:31.579–19:42:16.465; only one log.txt was available,
+so the earlier launch with the fix already disabled cannot be independently
+checked. Archived at
+`build/diagnostics/prototype07-hogwarts-2026-09-18-195101/`.
+
+Recorded settings and applied state agree with the user's second-run sequence:
+
+| Local time | Event / applied result |
+| --- | --- |
+| 19:40:36.971 | Native Stereo Fix on; optimizations blocked, baseline output |
+| 19:40:55.363 / .583 | Fix disabled; both eyes cropped and reduced |
+| 19:41:25.751 / 28.184 | Pixel reduction disabled; both eyes projection-only |
+| 19:41:42.187 / .590 | Projection crop disabled; baseline output |
+| 19:41:51.070 / .427 | Projection crop enabled; both eyes projection-only |
+| 19:41:56.670 / 57.861 | Pixel reduction enabled; both eyes reduced again |
+
+Across stable sampled intervals, the submitted frame counter advances about
+57.27/s with the fix on, 2.19/s with both experiments on and the fix off, 6.56/s
+with projection only, 7.24/s with both experiments off, and 1.12/s after enabling
+pixel reduction again. These are **frame-counter cadence observations**, not GPU
+time measurements or independently measured headset FPS. They corroborate the
+reported slowdown and its association with pixel reduction; they do not isolate
+the CPU/GPU cause. Scene/settings were not independently controlled.
+
+44 sampled submissions: 10 fix-on baseline, 5 fix-off baseline, 9 projection-only,
+20 reduced in both eyes. No logged resolve rejection, suppressed/failed state,
+or resource failure during these intervals. Thus the earlier latched recovery
+failure is not logged here. Loading recovery was not established by this run.
+No speedup is demonstrated. Next: map and instrument the Native Stereo Fix path
+with its compatibility behavior retained, then measure where frame time goes
+before another optimization benchmark. No further manual test requested now.
+
+Read-only compatibility review identifies three contracts to address:
+
+- Native Stereo Fix uses eye-local x=0 for both views; the current crop probe
+  expects the right eye at x=width in a packed target.
+- The fix renders into separate targets and packs them through pre-render copy
+  commands; crop initialization/resolve currently requires a direct source.
+- The fix copies OpenXR pipeline state to a subsequent queue slot; exact
+  render/pose/probe association must be established for that path.
+
+The smallest next engineering step is bounded, observation-only diagnostics at
+these seams with Native Stereo Fix on and cropping off, plus CPU/GPU timing.
+Removing the compatibility gate alone is insufficient. This code review does
+not establish the cause of the slowdown.
 
 Prototype 07 exercises the new requested-versus-applied status, transient frame
 suppression/recovery, and persistent resource-failure reporting. The diagnostics
@@ -22,7 +77,7 @@ not been measured. Turn on the volumetric frame and Performance
 Diagnostics. The initial menu is only a setup/full-FPS observation, not a
 benchmark.
 
-## Manual Hogwarts run
+## Historical manual Hogwarts run (do not repeat)
 
 1. In the initial menu, confirm the frame appears and note that this observation
    is not benchmark data. Start or load a save and wait for normal gameplay.
