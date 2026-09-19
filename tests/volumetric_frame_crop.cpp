@@ -147,6 +147,69 @@ void view_transition_test() {
     require(!lost && invalid.reduced_mask == 0, "Invalid candidate modified the baseline frame");
 }
 
+void submission_recovery_test() {
+    auto rendered = []() {
+        VolumetricFrameProbe probe{};
+        probe.pose_frame = 42;
+        probe.prepared = probe.layout.active = true;
+        probe.cropped_mask = probe.reduced_mask = probe.projection_mask = probe.rect_mask = 3;
+        return probe;
+    };
+    auto probe = rendered();
+    bool lost = false;
+    VolumetricFrameCropDiagnostic diagnostic{};
+    require(!validate_frame_crop_submission(probe, lost, diagnostic, false, 42, 42, 7, true) && lost,
+        "Missing render association did not suppress an uncertain image");
+    require(!probe.prepared && diagnostic.reason == VolumetricFrameCropLoss::MISSING_RENDER_ASSOCIATION &&
+        diagnostic.source_probe_frame == 42 && diagnostic.source_pose_generation == 7 &&
+        diagnostic.source_cropped_mask == 3 && diagnostic.source_reduced_mask == 3,
+        "Clearing an unassociated probe discarded source evidence");
+    validate_frame_crop_submission(probe, lost, diagnostic, false, 42, 42, 7, true);
+    require(diagnostic.source_reduced_mask == 3, "Repeated missing association erased original evidence");
+
+    probe = rendered();
+    lost = false;
+    diagnostic = {};
+    require(!validate_frame_crop_submission(probe, lost, diagnostic, true, 48, 42, 7, true) && lost &&
+        diagnostic.reason == VolumetricFrameCropLoss::QUEUE_SLOT_MISMATCH &&
+        diagnostic.requested_render_frame == 48 && diagnostic.source_pose_frame == 42,
+        "Wrapped queue slot accepted or lost its actual identity");
+
+    probe = rendered();
+    probe.cropped_mask = 1;
+    lost = false;
+    diagnostic = {};
+    require(validate_frame_crop_submission(probe, lost, diagnostic, true, 42, 42, 7, true) && lost &&
+        diagnostic.reason == VolumetricFrameCropLoss::REDUCED_WITHOUT_PROJECTION,
+        "Reduced eye without a projection escaped submission validation");
+
+    probe = rendered();
+    lost = false;
+    diagnostic = {};
+    replace_frame_crop_pose(probe, true, lost, diagnostic, 42, 7);
+    require(lost && !probe.prepared && diagnostic.reason == VolumetricFrameCropLoss::POSE_REPLACED &&
+        diagnostic.source_reduced_mask == 3 && diagnostic.source_pose_generation == 7,
+        "Pose replacement discarded escaped crop evidence");
+    validate_frame_crop_submission(probe, lost, diagnostic, true, 42, 42, 8, true);
+    require(lost && diagnostic.source_pose_generation == 7 && diagnostic.source_reduced_mask == 3,
+        "Submission replaced escaped source identity with replacement pose");
+
+    replace_frame_crop_pose(probe, false, lost, diagnostic, 42, 8);
+    require(!lost && diagnostic.reason == VolumetricFrameCropLoss::NONE,
+        "A fresh pose inherited a transient frame failure");
+    probe = rendered();
+    probe.pose_frame = 48;
+    require(validate_frame_crop_submission(probe, lost, diagnostic, true, 48, 48, 9, true) && !lost &&
+        diagnostic.reason == VolumetricFrameCropLoss::NONE && diagnostic.source_pose_frame == 48 &&
+        diagnostic.source_reduced_mask == 3, "Fresh matching rendered frame could not recover");
+
+    probe = {};
+    lost = false;
+    diagnostic = {};
+    require(!validate_frame_crop_submission(probe, lost, diagnostic, false, 0, 0, 0, false) && !lost,
+        "Unmodified startup frame was unnecessarily marked crop-lost");
+}
+
 int main() try {
     const int width = 2053, height = 1999;
     const VolumetricFramePixelRect submitted{103, 81, 1843, 1796};
@@ -238,7 +301,8 @@ int main() try {
     projection_test<float>();
     projection_test<double>();
     view_transition_test();
-    std::puts("PASS: crop containment, projection/pixel mapping, phase 2/3 view decisions, packing, callback order and fail-closed transitions");
+    submission_recovery_test();
+    std::puts("PASS: crop geometry, view decisions, fail-closed submission reasons, source identity and fresh-frame recovery");
     return 0;
 } catch (const std::exception& e) {
     std::printf("FAIL: %s\n", e.what());

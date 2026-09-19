@@ -221,6 +221,7 @@ public:
         bool stage_pose_valid{false};
         uint64_t pose_generation{0};
         bool frame_crop_lost{false};
+        vrmod::VolumetricFrameCropDiagnostic frame_crop_diagnostic{};
         vrmod::VolumetricFrameProbe frame_probe{};
     };
     /*std::array<std::vector<XrView>, 3> stage_view_queue{};

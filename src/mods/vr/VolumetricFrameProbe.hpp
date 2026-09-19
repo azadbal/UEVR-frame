@@ -7,6 +7,35 @@
 
 namespace vrmod {
 
+enum class VolumetricFrameCropLoss {
+    NONE, MISSING_RENDER_ASSOCIATION, QUEUE_SLOT_MISMATCH, REDUCED_WITHOUT_PROJECTION,
+    POSE_REPLACED, VIEW_RECT_CHANGED, REDUCTION_DISALLOWED, PROJECTION_INVALID
+};
+
+inline const char* frame_crop_loss_name(VolumetricFrameCropLoss reason) {
+    switch (reason) {
+    case VolumetricFrameCropLoss::NONE: return "none";
+    case VolumetricFrameCropLoss::MISSING_RENDER_ASSOCIATION: return "missing-render-association";
+    case VolumetricFrameCropLoss::QUEUE_SLOT_MISMATCH: return "queue-slot-mismatch";
+    case VolumetricFrameCropLoss::REDUCED_WITHOUT_PROJECTION: return "reduced-without-projection";
+    case VolumetricFrameCropLoss::POSE_REPLACED: return "pose-replaced";
+    case VolumetricFrameCropLoss::VIEW_RECT_CHANGED: return "view-rect-changed";
+    case VolumetricFrameCropLoss::REDUCTION_DISALLOWED: return "reduction-disallowed";
+    case VolumetricFrameCropLoss::PROJECTION_INVALID: return "projection-invalid";
+    }
+    return "unknown";
+}
+
+struct VolumetricFrameCropDiagnostic {
+    VolumetricFrameCropLoss reason{VolumetricFrameCropLoss::NONE};
+    bool render_frame_associated{false};
+    uint32_t requested_render_frame{0};
+    uint32_t source_pose_frame{0}, source_probe_frame{0};
+    uint64_t source_pose_generation{0};
+    uint32_t source_cropped_mask{0}, source_reduced_mask{0};
+    uint32_t source_projection_mask{0}, source_rect_mask{0};
+};
+
 // Stored with OpenXR's pose queue, not in a global "latest frame" variable.
 struct VolumetricFrameProbe {
     uint32_t pose_frame{0};
@@ -89,5 +118,68 @@ struct VolumetricFrameProbe {
             width == output_width && height == output_height;
     }
 };
+
+inline void capture_frame_crop_source(VolumetricFrameCropDiagnostic& diagnostic,
+    const VolumetricFrameProbe& probe, uint32_t pose_frame, uint64_t pose_generation) {
+    diagnostic.source_pose_frame = pose_frame;
+    diagnostic.source_probe_frame = probe.pose_frame;
+    diagnostic.source_pose_generation = pose_generation;
+    diagnostic.source_cropped_mask = probe.cropped_mask;
+    diagnostic.source_reduced_mask = probe.reduced_mask;
+    diagnostic.source_projection_mask = probe.projection_mask;
+    diagnostic.source_rect_mask = probe.rect_mask;
+}
+
+// Called before replacing pose data. Retain the first escaped view's identity
+// even though the probe itself must be rebuilt for the replacement pose.
+inline void replace_frame_crop_pose(VolumetricFrameProbe& probe, bool same_frame, bool& lost,
+    VolumetricFrameCropDiagnostic& diagnostic, uint32_t pose_frame, uint64_t pose_generation) {
+    const auto previous = probe;
+    if (!same_frame) {
+        lost = false;
+        diagnostic = {};
+    } else if (!lost && previous.has_modified_view()) {
+        lost = true;
+        capture_frame_crop_source(diagnostic, previous, pose_frame, pose_generation);
+        diagnostic.reason = VolumetricFrameCropLoss::POSE_REPLACED;
+    }
+    probe = {};
+    if (same_frame) {
+        probe.reduce_pixels_blocked = previous.reduce_pixels_blocked;
+        probe.scene_rects = previous.scene_rects;
+        probe.rect_mask = previous.rect_mask;
+        probe.projection_mask = previous.projection_mask;
+        probe.crop_decision_mask = previous.crop_decision_mask;
+    }
+}
+
+// Returns whether this submission still has a render/pose association. Loss
+// suppresses only this frame; a fresh matching queue entry can recover.
+inline bool validate_frame_crop_submission(VolumetricFrameProbe& probe, bool& lost,
+    VolumetricFrameCropDiagnostic& diagnostic, bool associated, uint32_t render_frame,
+    uint32_t pose_frame, uint64_t pose_generation, bool ever_modified) {
+    diagnostic.render_frame_associated = associated;
+    diagnostic.requested_render_frame = render_frame;
+    if (!associated || render_frame != pose_frame) {
+        // Missing association can recur after this probe was already cleared.
+        if (diagnostic.reason == VolumetricFrameCropLoss::NONE) {
+            capture_frame_crop_source(diagnostic, probe, pose_frame, pose_generation);
+        }
+        diagnostic.reason = associated ? VolumetricFrameCropLoss::QUEUE_SLOT_MISMATCH :
+            VolumetricFrameCropLoss::MISSING_RENDER_ASSOCIATION;
+        lost = lost || ever_modified || probe.has_modified_view();
+        probe = {};
+        return false;
+    }
+    if (!lost) {
+        capture_frame_crop_source(diagnostic, probe, pose_frame, pose_generation);
+        diagnostic.reason = VolumetricFrameCropLoss::NONE;
+        if ((probe.reduced_mask & ~probe.cropped_mask) != 0) {
+            lost = true;
+            diagnostic.reason = VolumetricFrameCropLoss::REDUCED_WITHOUT_PROJECTION;
+        }
+    }
+    return true;
+}
 
 } // namespace vrmod

@@ -222,23 +222,11 @@ VRRuntime::Error OpenXR::update_poses(bool from_view_extensions, uint32_t frame_
     // A same-frame pose replacement cannot discard an already returned crop.
     // Suppress that submission instead of presenting it with a new mapping.
     const bool same_frame = pipeline_state.pose_frame_count == frame_count;
-    const auto previous_probe = pipeline_state.frame_probe;
-    const bool reduction_blocked = same_frame && pipeline_state.frame_probe.reduce_pixels_blocked;
-    pipeline_state.frame_crop_lost = same_frame &&
-        (pipeline_state.frame_probe.has_modified_view() || pipeline_state.frame_crop_lost);
+    vrmod::replace_frame_crop_pose(pipeline_state.frame_probe, same_frame, pipeline_state.frame_crop_lost,
+        pipeline_state.frame_crop_diagnostic, pipeline_state.pose_frame_count, pipeline_state.pose_generation);
     pipeline_state.pose_frame_count = frame_count;
     ++pipeline_state.pose_generation;
     pipeline_state.stage_pose_valid = false;
-    pipeline_state.frame_probe = {};
-    pipeline_state.frame_probe.reduce_pixels_blocked = reduction_blocked;
-    if (same_frame) {
-        // Preserve callback decisions even when no crop was returned: a later
-        // pose must not shrink a view whose full projection already escaped.
-        pipeline_state.frame_probe.scene_rects = previous_probe.scene_rects;
-        pipeline_state.frame_probe.rect_mask = previous_probe.rect_mask;
-        pipeline_state.frame_probe.projection_mask = previous_probe.projection_mask;
-        pipeline_state.frame_probe.crop_decision_mask = previous_probe.crop_decision_mask;
-    }
 
     if (pipeline_state.frame_state.predictedDisplayTime <= 1000) {
         pipeline_state.frame_state = this->frame_state;
@@ -718,22 +706,18 @@ OpenXR::PipelineState OpenXR::get_submit_state(bool consume) {
 
     if (this->has_render_frame_count) {
         last_submit_state = this->pipeline_states[this->internal_render_frame_count % QUEUE_SIZE];
-        if (last_submit_state.pose_frame_count != this->internal_render_frame_count) {
-            // A queue slot can have wrapped even when its own fields agree.
-            // Compare with the requested render frame, not only with the slot.
-            last_submit_state.frame_probe = {};
-            last_submit_state.stage_pose_valid = false;
-            last_submit_state.frame_crop_lost = frame_crop_ever_applied.load();
-        }
     } else {
         // No rendered-frame association: never reuse a previous frame's probe.
-        last_submit_state.frame_probe = {};
-        last_submit_state.stage_pose_valid = false;
-        last_submit_state.frame_crop_lost = frame_crop_ever_applied.load();
         last_submit_state.stage_views = get_current_stage_view();
         last_submit_state.view_space_location = this->view_space_location;
         last_submit_state.frame_state = this->frame_state;
         last_submit_state.frame_count = this->internal_frame_count;
+    }
+
+    if (!vrmod::validate_frame_crop_submission(last_submit_state.frame_probe, last_submit_state.frame_crop_lost,
+        last_submit_state.frame_crop_diagnostic, this->has_render_frame_count, this->internal_render_frame_count,
+        last_submit_state.pose_frame_count, last_submit_state.pose_generation, frame_crop_ever_applied.load())) {
+        last_submit_state.stage_pose_valid = false;
     }
 
     if (consume) {
@@ -744,9 +728,6 @@ OpenXR::PipelineState OpenXR::get_submit_state(bool consume) {
         spdlog::warn("[VR] Frame state is older than previous frame state!");
     }*/
 
-    if ((last_submit_state.frame_probe.reduced_mask & ~last_submit_state.frame_probe.cropped_mask) != 0) {
-        last_submit_state.frame_crop_lost = true;
-    }
     return last_submit_state;
 }
 
@@ -759,8 +740,17 @@ vrmod::VolumetricFramePixelRect OpenXR::record_frame_view_rect(uint32_t eye, int
     auto& state = pipeline_states[internal_frame_count % QUEUE_SIZE];
     if (state.pose_frame_count != internal_frame_count) return incoming;
     if (!state.frame_probe.prepared || !allow_reduction) state.frame_probe.reduce_pixels_blocked = true;
-    if (!allow_reduction && state.frame_probe.has_modified_view()) state.frame_crop_lost = true;
+    const bool was_lost = state.frame_crop_lost;
+    if (!allow_reduction && state.frame_probe.has_modified_view()) {
+        state.frame_crop_lost = true;
+    }
     const auto actual = state.frame_probe.record_view_rect(eye, incoming, state.frame_crop_lost);
+    if (!was_lost && state.frame_crop_lost) {
+        vrmod::capture_frame_crop_source(state.frame_crop_diagnostic, state.frame_probe,
+            state.pose_frame_count, state.pose_generation);
+        state.frame_crop_diagnostic.reason = !allow_reduction ? vrmod::VolumetricFrameCropLoss::REDUCTION_DISALLOWED :
+            vrmod::VolumetricFrameCropLoss::VIEW_RECT_CHANGED;
+    }
     if (state.frame_probe.has_modified_view()) frame_crop_ever_applied = true;
     return actual;
 }
@@ -849,8 +839,14 @@ std::optional<OpenXR::FrameCrop> OpenXR::apply_frame_crop(uint32_t eye) {
     std::scoped_lock lock{sync_assignment_mtx};
     auto& state = pipeline_states[internal_frame_count % QUEUE_SIZE];
     auto& probe = state.frame_probe;
-    if (state.pose_frame_count != internal_frame_count ||
-        !probe.apply_projection_crop(eye, state.frame_crop_lost)) return std::nullopt;
+    if (state.pose_frame_count != internal_frame_count) return std::nullopt;
+    const bool was_lost = state.frame_crop_lost;
+    const bool cropped = probe.apply_projection_crop(eye, state.frame_crop_lost);
+    if (!was_lost && state.frame_crop_lost) {
+        vrmod::capture_frame_crop_source(state.frame_crop_diagnostic, probe, state.pose_frame_count, state.pose_generation);
+        state.frame_crop_diagnostic.reason = vrmod::VolumetricFrameCropLoss::PROJECTION_INVALID;
+    }
+    if (!cropped) return std::nullopt;
     frame_crop_ever_applied = true;
     return FrameCrop{probe.crops[eye].rect, probe.width, probe.height};
 }

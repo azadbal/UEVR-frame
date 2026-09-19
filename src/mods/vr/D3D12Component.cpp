@@ -28,11 +28,41 @@ constexpr auto ENGINE_SRC_DEPTH = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOUR
 constexpr auto ENGINE_SRC_COLOR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
 namespace vrmod {
+void D3D12Component::report_frame_crop(VolumetricFrameResolveResult result, uint32_t cropped, uint32_t reduced,
+    const char* reason, uint32_t frame) {
+    const auto& vr = VR::get();
+    const uint32_t settings = (uint32_t)vr->m_volumetric_frame->value() |
+        ((uint32_t)vr->m_volumetric_frame_crop->value() << 1) |
+        ((uint32_t)vr->m_volumetric_frame_reduce_pixels->value() << 2) |
+        ((uint32_t)vr->is_native_stereo_fix_enabled() << 3) |
+        ((uint32_t)vr->is_sceneview_compatibility_enabled() << 4) |
+        ((uint32_t)vr->is_splitscreen_compatibility_enabled() << 5) |
+        ((uint32_t)vr->m_volumetric_frame_diagnostics->value() << 6);
+    std::scoped_lock lock{m_frame_status_mtx};
+    const bool changed = m_frame_status_settings != settings || m_frame_status.result != result ||
+        m_frame_status.cropped != cropped || m_frame_status.reduced != reduced ||
+        std::string_view{m_frame_status.reason} != reason;
+    if (changed && (vr->m_volumetric_frame_diagnostics->value() || (m_frame_status_settings != ~0u && (m_frame_status_settings & 64)))) {
+        const char* names[]{"baseline", "resolved", "suppressed", "failed"};
+        spdlog::info("[Frame Perf] state frame={} frame_enabled={} crop_setting={} reduce_setting={} native_fix={} sceneview={} splitscreen={} result={} cropped={} reduced={} reason={} resource_failed={}",
+            frame, vr->m_volumetric_frame->value(), vr->m_volumetric_frame_crop->value(), vr->m_volumetric_frame_reduce_pixels->value(),
+            vr->is_native_stereo_fix_enabled(), vr->is_sceneview_compatibility_enabled(), vr->is_splitscreen_compatibility_enabled(),
+            names[(int)result], cropped, reduced, reason, m_frame_resolve_failed.load());
+    }
+    m_frame_status_settings = settings;
+    m_frame_status = {result, cropped, reduced, reason, std::chrono::steady_clock::now()};
+}
+
 bool D3D12Component::setup_frame_resolve(ID3D12Device* device) {
     if (m_frame_resolve_pipeline != nullptr) {
         return true;
     }
-    if (m_frame_resolve_failed || !setup_volumetric_frame(device)) {
+    if (m_frame_resolve_failed) {
+        return false;
+    }
+    if (!setup_volumetric_frame(device)) {
+        m_frame_resolve_failed = true;
+        m_frame_crop_dimensions = 0;
         return false;
     }
     D3D12_DESCRIPTOR_RANGE range{};
@@ -92,7 +122,16 @@ bool D3D12Component::resolve_volumetric_frame(d3d12::TextureContext& target, d3d
     auto& vr = VR::get();
     const auto state = vr->m_openxr->get_submit_state(false);
     const auto& probe = state.frame_probe;
+    m_frame_submission_suppressed = false;
+    m_frame_submission_resolved = false;
     if (probe.cropped_mask == 0 && probe.reduced_mask == 0 && !state.frame_crop_lost) {
+        const auto blocker = vr->frame_crop_block_reason();
+        const char* reason = blocker != nullptr ? blocker : m_frame_resolve_failed ? "resource-failure" :
+            m_frame_crop_dimensions == 0 ? "initializing-resolve" : !probe.prepared ? "geometry-not-prepared" :
+            !probe.layout.active ? "frame-layout-inactive" : probe.rect_mask != 3 || probe.projection_mask != 3 ? "incomplete-view-callbacks" :
+            "full-view-fallback";
+        report_frame_crop(m_frame_resolve_failed ? VolumetricFrameResolveResult::FAILED : VolumetricFrameResolveResult::BASELINE,
+            0, 0, reason, state.frame_count);
         return false;
     }
 
@@ -101,29 +140,34 @@ bool D3D12Component::resolve_volumetric_frame(d3d12::TextureContext& target, d3d
     // cropped rays over a full-FOV image.
     const auto desc = target.texture->GetDesc();
     const auto source_desc = source != nullptr ? source->GetDesc() : D3D12_RESOURCE_DESC{};
-    bool valid = !state.frame_crop_lost && (probe.reduced_mask & ~probe.cropped_mask) == 0 &&
+    bool snapshot_valid = (probe.reduced_mask & ~probe.cropped_mask) == 0 &&
         probe.rect_mask == 3 && probe.projection_mask == 3 &&
         probe.matches(state.frame_count, (int)desc.Width / 2, (int)desc.Height) &&
-        state.stage_views.size() == 2 && scratch != nullptr && scratch->texture != nullptr && scratch->srv_heap != nullptr &&
+        state.stage_views.size() == 2;
+    const bool resources_valid = scratch != nullptr && scratch->texture != nullptr && scratch->srv_heap != nullptr &&
         m_frame_resolve_pipeline != nullptr && m_frame_pipeline != nullptr && direct_copy &&
         source_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && source_desc.Width == desc.Width &&
         source_desc.Height == desc.Height && source_desc.DepthOrArraySize == 1 && source_desc.MipLevels == 1 &&
         source_desc.SampleDesc.Count == 1 &&
         (source_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || source_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
             source_desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS);
-    for (uint32_t eye = 0; valid && eye < 2; ++eye) {
+    for (uint32_t eye = 0; snapshot_valid && eye < 2; ++eye) {
         if ((probe.cropped_mask & (1u << eye)) == 0) {
-            valid = probe.baseline_rect(eye, probe.scene_rects[eye]);
+            snapshot_valid = probe.baseline_rect(eye, probe.scene_rects[eye]);
             continue;
         }
         const auto& rect = probe.crops[eye].rect;
-        valid = probe.can_crop(eye) && rect.x >= 0 && rect.y >= 0 && rect.width > 0 && rect.height > 0 &&
+        snapshot_valid = probe.can_crop(eye) && rect.x >= 0 && rect.y >= 0 && rect.width > 0 && rect.height > 0 &&
             rect.x <= probe.width - rect.width && rect.y <= probe.height - rect.height;
     }
+    const auto result = frame_resolve_result(probe.has_modified_view(), state.frame_crop_lost,
+        snapshot_valid, resources_valid, m_frame_resolve_failed.load());
     if (target.rtv_heap == nullptr) {
         if (!target.create_rtv(g_framework->get_d3d12_hook()->get_device(), DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) {
             m_frame_crop_dimensions = 0;
             m_frame_resolve_failed = true;
+            m_frame_submission_suppressed = true;
+            report_frame_crop(VolumetricFrameResolveResult::FAILED, 0, 0, "output-rtv-failure", state.frame_count);
             spdlog::error("[Frame Perf] Cannot clear invalid cropped frame: no output RTV");
             return true;
         }
@@ -133,12 +177,24 @@ bool D3D12Component::resolve_volumetric_frame(d3d12::TextureContext& target, d3d
     const auto rtv = target.get_rtv();
     list->ClearRenderTargetView(rtv, background, 0, nullptr);
     target.commands.has_commands = true;
-    if (!valid) {
-        m_frame_crop_dimensions = 0;
-        m_frame_resolve_failed = true;
+    if (result != VolumetricFrameResolveResult::RESOLVED) {
+        // Association/callback loss suppresses this frame only. Keep readiness
+        // so the next correctly associated frame can recover automatically.
+        if (result == VolumetricFrameResolveResult::FAILED) {
+            m_frame_crop_dimensions = 0;
+            m_frame_resolve_failed = true;
+        }
+        m_frame_submission_suppressed = true;
         vr->m_volumetric_frame_layout.active = false;
-        SPDLOG_ERROR_EVERY_N_SEC(1, "[Frame Perf] Cropped frame {} cannot be resolved (lost={} mask={}); showing surroundings and disabling crop until reset",
-            state.frame_count, state.frame_crop_lost, probe.cropped_mask);
+        const auto& diagnostic = state.frame_crop_diagnostic;
+        const char* reason = state.frame_crop_lost ? frame_crop_loss_name(diagnostic.reason) :
+            !snapshot_valid ? "invalid-snapshot" : "incompatible-resolve-resources";
+        SPDLOG_INFO_EVERY_N_SEC(1, "[Frame Perf] resolve rejected frame={} reason={} transient={} associated={} requested_render={} source_pose={} source_probe={} generation={} source_cropped={} source_reduced={} source_projections={} source_rects={} snapshot_valid={} resources_valid={}",
+            state.frame_count, reason, result == VolumetricFrameResolveResult::SUPPRESSED,
+            diagnostic.render_frame_associated, diagnostic.requested_render_frame, diagnostic.source_pose_frame,
+            diagnostic.source_probe_frame, diagnostic.source_pose_generation, diagnostic.source_cropped_mask,
+            diagnostic.source_reduced_mask, diagnostic.source_projection_mask, diagnostic.source_rect_mask, snapshot_valid, resources_valid);
+        report_frame_crop(result, 0, 0, reason, state.frame_count);
         return true;
     }
     target.commands.copy(source, scratch->texture.Get(), source_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -166,6 +222,9 @@ bool D3D12Component::resolve_volumetric_frame(d3d12::TextureContext& target, d3d
         list->SetGraphicsRoot32BitConstants(0, 8, constants.data(), 0);
         list->DrawInstanced(3, 1, 0, 0);
     }
+    m_frame_submission_resolved = true;
+    m_frame_resolved_frame = state.frame_count;
+    m_frame_resolved_generation = state.pose_generation;
     return true;
 }
 
@@ -287,8 +346,30 @@ void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12
     // The layer builder runs later in this same frame. Never leave it with a
     // pose from a previous frame when the mask cannot be produced.
     vr->m_volumetric_frame_layout.active = false;
+    if (m_frame_submission_suppressed) return;
+    auto reject_mask = [&](const char* reason, bool resource_failure) {
+        if (!cropped && !m_frame_submission_resolved && !state.frame_crop_lost) return;
+        if (resource_failure) {
+            m_frame_resolve_failed = true;
+            m_frame_crop_dimensions = 0;
+        }
+        m_frame_submission_suppressed = true;
+        if (target.rtv_heap != nullptr) {
+            const float background[]{0, state.frame_probe.green ? 1.0f : 0.0f, 0, 1};
+            target.commands.cmd_list->ClearRenderTargetView(target.get_rtv(), background, 0, nullptr);
+            target.commands.has_commands = true;
+        }
+        report_frame_crop(m_frame_resolve_failed ? VolumetricFrameResolveResult::FAILED : VolumetricFrameResolveResult::SUPPRESSED,
+            0, 0, reason, state.frame_count);
+    };
     if (state.frame_crop_lost || (cropped && m_frame_resolve_failed) || (cropped && !state.frame_probe.matches(state.frame_count,
             (int)resource->GetDesc().Width / 2, (int)resource->GetDesc().Height))) {
+        reject_mask("mask-frame-invalid", false);
+        return;
+    }
+    if (m_frame_submission_resolved && (!cropped || state.frame_count != m_frame_resolved_frame ||
+        state.pose_generation != m_frame_resolved_generation)) {
+        reject_mask("mask-resolve-frame-changed", false);
         return;
     }
     if (!cropped && !vr->is_volumetric_frame_enabled()) {
@@ -297,6 +378,7 @@ void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12
     }
 
     if (state.stage_views.size() != 2) {
+        reject_mask("mask-eye-poses-unavailable", false);
         return;
     }
     const auto desc = resource->GetDesc();
@@ -306,15 +388,18 @@ void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12
             spdlog::error("[Volumetric Frame] Multisampled swapchains are unsupported");
         }
         m_frame_mask_failed = true;
+        reject_mask("mask-multisampling-unsupported", true);
         return;
     }
     if (!setup_volumetric_frame(device)) {
+        reject_mask("mask-pipeline-failure", true);
         return;
     }
     if (target.rtv_heap == nullptr) {
         target.texture = resource;
         if (!target.create_rtv(device, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) {
             m_frame_mask_failed = true;
+            reject_mask("mask-rtv-failure", true);
             return;
         }
     }
@@ -404,6 +489,9 @@ void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12
         list->DrawInstanced(3, 1, 0, 0);
     }
     target.commands.has_commands = true;
+    if (m_frame_submission_resolved) {
+        report_frame_crop(VolumetricFrameResolveResult::RESOLVED, probe.cropped_mask, probe.reduced_mask, "none", state.frame_count);
+    }
 }
 
 vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
@@ -1424,7 +1512,17 @@ void D3D12Component::on_post_present(VR* vr) {
 }
 
 void D3D12Component::on_reset(VR* vr) {
+    if (vr->m_volumetric_frame_diagnostics->value()) {
+        spdlog::info("[Frame Perf] reset: clearing crop readiness and status; resource failure was {}", m_frame_resolve_failed.load());
+    }
     m_frame_crop_dimensions = 0;
+    m_frame_submission_suppressed = false;
+    m_frame_submission_resolved = false;
+    {
+        std::scoped_lock lock{m_frame_status_mtx};
+        m_frame_status = {};
+        m_frame_status_settings = ~0u;
+    }
     m_force_reset = true;
     vr->m_volumetric_frame_layout.active = false;
 

@@ -578,6 +578,15 @@ public:
     }
 
     bool is_volumetric_frame_supported() const;
+    const char* frame_crop_block_reason() const {
+        if (!m_volumetric_frame->value()) return "Frame disabled";
+        if (!m_volumetric_frame_crop->value()) return "Projection crop disabled";
+        if (!is_volumetric_frame_supported()) return "Unsupported rendering mode";
+        if (is_native_stereo_fix_enabled()) return "Native Stereo Fix enabled";
+        if (is_sceneview_compatibility_enabled()) return "SceneView compatibility enabled";
+        if (is_splitscreen_compatibility_enabled()) return "SplitScreen compatibility enabled";
+        return nullptr;
+    }
     bool is_frame_crop_requested() const {
         return is_volumetric_frame_enabled() && m_volumetric_frame_crop->value() &&
             !is_native_stereo_fix_enabled() && !is_sceneview_compatibility_enabled() &&

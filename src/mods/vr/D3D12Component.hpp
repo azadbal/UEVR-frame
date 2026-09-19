@@ -23,6 +23,8 @@
 #include "d3d12/CommandContext.hpp"
 #include "d3d12/TextureContext.hpp"
 #include "VolumetricFrameLayout.hpp"
+#include "VolumetricFrameResolve.hpp"
+#include <chrono>
 
 class VR;
 
@@ -53,6 +55,17 @@ public:
             ((uint64_t)(uint32_t)width << 32 | (uint32_t)height);
     }
     VolumetricFrameLayout prepare_volumetric_frame(const std::array<glm::mat4, 2>& eyes);
+    struct FrameCropStatus {
+        VolumetricFrameResolveResult result{VolumetricFrameResolveResult::BASELINE};
+        uint32_t cropped{0}, reduced{0};
+        const char* reason{"waiting-for-frame"};
+        std::chrono::steady_clock::time_point updated{};
+    };
+    FrameCropStatus frame_crop_status() const {
+        std::scoped_lock lock{m_frame_status_mtx};
+        return m_frame_status;
+    }
+    bool frame_crop_failed() const { return m_frame_resolve_failed.load() || m_frame_mask_failed.load(); }
 
 private:
     bool setup();
@@ -70,6 +83,8 @@ private:
     bool resolve_volumetric_frame(d3d12::TextureContext& target, d3d12::TextureContext* scratch,
         ID3D12Resource* source, D3D12_RESOURCE_STATES source_state, bool direct_copy);
     void reset_volumetric_frame_anchor();
+    void report_frame_crop(VolumetricFrameResolveResult result, uint32_t cropped, uint32_t reduced,
+        const char* reason, uint32_t frame);
 
     template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
 
@@ -79,7 +94,14 @@ private:
     ComPtr<ID3D12RootSignature> m_frame_resolve_root{};
     ComPtr<ID3D12PipelineState> m_frame_resolve_pipeline{};
     std::atomic<uint64_t> m_frame_crop_dimensions{0};
-    bool m_frame_resolve_failed{false};
+    std::atomic<bool> m_frame_resolve_failed{false};
+    mutable std::mutex m_frame_status_mtx{};
+    FrameCropStatus m_frame_status{};
+    uint32_t m_frame_status_settings{~0u};
+    bool m_frame_submission_suppressed{false};
+    bool m_frame_submission_resolved{false};
+    uint32_t m_frame_resolved_frame{0};
+    uint64_t m_frame_resolved_generation{0};
     glm::mat4 m_frame_anchor{1.0f};
     std::mutex m_frame_anchor_mtx{};
     bool m_frame_was_enabled{false};

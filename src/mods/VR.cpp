@@ -2405,7 +2405,9 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
 
         if (ImGui::TreeNode("Volumetric Frame (Experimental)")) {
             const auto was_enabled = m_volumetric_frame->value();
-            m_volumetric_frame->draw("Enable Volumetric Frame");
+            if (m_volumetric_frame->draw("Enable Volumetric Frame")) {
+                spdlog::info("[Frame Perf] setting VolumetricFrame={}", m_volumetric_frame->value());
+            }
             if (was_enabled != m_volumetric_frame->value()) {
                 m_volumetric_frame_recenter = true;
             }
@@ -2428,15 +2430,46 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 m_volumetric_frame_recenter = true;
             }
             ImGui::TextWrapped("Black surroundings when green is off. Depth submission is disabled while the frame is active. Matching uses a fixed 16:9 portal rectangle.");
-            m_volumetric_frame_crop->draw("Experimental Projection Crop");
+            if (m_volumetric_frame_crop->draw("Experimental Projection Crop")) {
+                spdlog::info("[Frame Perf] setting ProjectionCrop={}", m_volumetric_frame_crop->value());
+            }
             if (m_volumetric_frame_crop->value()) {
                 ImGui::TextWrapped("Narrows the game views through the frame. Turn off Native Stereo Fix, SceneView and SplitScreen compatibility. Disable this option if the image looks wrong.");
-                m_volumetric_frame_reduce_pixels->draw("Reduce Scene Pixels (Experimental)");
+                if (m_volumetric_frame_reduce_pixels->draw("Reduce Scene Pixels (Experimental)")) {
+                    spdlog::info("[Frame Perf] setting ReduceScenePixels={}", m_volumetric_frame_reduce_pixels->value());
+                }
                 ImGui::TextWrapped("Renders only the crop's pixel dimensions inside the existing textures. Headset output resolution stays unchanged. Off keeps the previous full-resolution crop test.");
             }
-            m_volumetric_frame_diagnostics->draw("Performance Diagnostics");
+            if (const auto blocker = frame_crop_block_reason()) {
+                ImGui::TextWrapped("Optimization: Inactive (%s)", blocker);
+            } else if (m_d3d12.frame_crop_failed()) {
+                ImGui::TextWrapped("Optimization: Failed (rendering resources). Restart the game before retrying; see the log.");
+            } else {
+                const auto status = m_d3d12.frame_crop_status();
+                if (std::chrono::steady_clock::now() - status.updated > std::chrono::seconds(2)) {
+                    ImGui::TextWrapped("Optimization: Waiting for a rendered frame");
+                } else if (status.result == vrmod::VolumetricFrameResolveResult::SUPPRESSED) {
+                    ImGui::TextWrapped("Optimization: Recovering (frame data unavailable)");
+                } else if (status.result == vrmod::VolumetricFrameResolveResult::RESOLVED) {
+                    if (status.cropped == 3 && status.reduced == 3) {
+                        ImGui::TextWrapped("Optimization: Active - reduced pixels in both eyes");
+                    } else if (status.cropped == 3 && status.reduced == 0) {
+                        ImGui::TextWrapped("Optimization: Active - projection crop only");
+                        if (m_volumetric_frame_reduce_pixels->value()) {
+                            ImGui::TextWrapped("Pixel reduction is requested but not applied to this frame.");
+                        }
+                    } else {
+                        ImGui::TextWrapped("Optimization: Partial - one or both eyes use a fallback");
+                    }
+                } else {
+                    ImGui::TextWrapped("Optimization: Waiting for a supported frame");
+                }
+            }
+            if (m_volumetric_frame_diagnostics->draw("Performance Diagnostics")) {
+                spdlog::info("[Frame Perf] setting Diagnostics={}", m_volumetric_frame_diagnostics->value());
+            }
             if (m_volumetric_frame_diagnostics->value()) {
-                ImGui::TextWrapped("Records rendering bounds and crop decisions in the UEVR log.");
+                ImGui::TextWrapped("Records requested settings, actual rendering and recovery in the UEVR log. Does not measure GPU frame time.");
             }
             ImGui::TreePop();
         }
@@ -2474,7 +2507,9 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
 
         ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
         if (ImGui::TreeNode("Native Stereo Fix")) {
-            m_native_stereo_fix->draw("Enabled");
+            if (m_native_stereo_fix->draw("Enabled")) {
+                spdlog::info("[Frame Perf] setting NativeStereoFix={}", m_native_stereo_fix->value());
+            }
             m_native_stereo_fix_same_pass->draw("Use Same Stereo Pass");
             ImGui::TreePop();
         }
