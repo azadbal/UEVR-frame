@@ -601,6 +601,12 @@ public:
     }
 
     float get_frame_fixed_view_scale() const { return m_volumetric_frame_fixed_view_scale->value(); }
+    // Raw settings for diagnostics, independent of renderer compatibility gates.
+    bool get_volumetric_frame_setting() const { return m_volumetric_frame->value(); }
+    bool get_frame_crop_setting() const { return m_volumetric_frame_crop->value(); }
+    bool get_frame_pixel_reduction_setting() const { return m_volumetric_frame_reduce_pixels->value(); }
+    bool is_frame_diagnostics_enabled() const { return m_volumetric_frame_diagnostics->value(); }
+    bool is_frame_capture_requested() const { return m_volumetric_frame_capture->value(); }
 
     bool is_game_ui_following_frame() const {
         return is_volumetric_frame_enabled() && m_volumetric_frame_move_ui->value() && m_volumetric_frame_layout.active;

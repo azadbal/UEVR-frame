@@ -1,6 +1,6 @@
 param(
-    [string]$Package = 'C:/Users/Azad/Documents/_apps/UEVR/volumetric-frame-prototype-10',
-    [string]$FrontendConfig = 'C:/Users/Azad/AppData/Local/praydog/UEVRInjector_Path_x2xdkjaolgeqyaix1mfwi02x3qa410oe/1.0.0.0/user.config',
+    [string]$Package = 'C:/Users/Azad/Documents/_apps/UEVR/volumetric-frame-prototype-11',
+    [string]$FrontendConfig = 'C:/Users/Azad/AppData/Local/praydog/UEVRInjector_Path_bmd13ubm4lnsejsq5kntwq11ij0xsawc/1.0.0.0/user.config',
     [ValidateSet('FluidFlux','DeepRock')][string]$GamePreset = 'FluidFlux',
     [ValidateRange(1,3)][int]$ResolutionScale = 3,
     [ValidateSet(0,1,2)][int]$VirtualDesktopFixOverride = 0,
@@ -101,6 +101,11 @@ $settings = [ordered]@{
     VR_Compatibility_SceneView = 'false'
     VR_Compatibility_SplitScreen = 'false'
 }
+if ($GamePreset -eq 'DeepRock') {
+    # The agent must see the Continue screen and confirm gameplay before measuring.
+    # The original spectator preference is restored with the rest of the profile.
+    $settings['VR_DesktopRecordingFix_V2'] = 'true'
+}
 $content = [IO.File]::ReadAllText($config)
 foreach ($entry in $settings.GetEnumerator()) {
     $pattern = '(?m)^' + [regex]::Escape($entry.Key) + '=[^\r\n]*'
@@ -116,6 +121,7 @@ $failure = $null
 $matchedSamples = 0
 $gpuSamples = 0
 $lastStatus = ''
+$shutdownCrashDetected = $false
 $started = Get-Date
 $stopwatch = [Diagnostics.Stopwatch]::StartNew()
 try {
@@ -194,6 +200,22 @@ try {
         } while ($residualWait.Elapsed.TotalSeconds -lt 5)
         if ($remaining.Count) { throw "Processes remain after cleanup: $($remaining.Id -join ', ')" }
     } catch { $processesStopped = $false; $cleanupErrors += $_.Exception.Message }
+    if ($GamePreset -eq 'DeepRock') {
+        # A game can finish measuring and then crash on shutdown. Its reporter
+        # keeps Steam's session alive; do not mistake that for clean teardown.
+        $expectedReporter = [IO.Path]::GetFullPath((Join-Path (Split-Path $Game -Parent) 'Engine/Binaries/Win64/CrashReportClient.exe'))
+        foreach ($reporter in @(Get-Process -Name CrashReportClient -ErrorAction SilentlyContinue)) {
+            try {
+                if ($reporter.Path -eq $expectedReporter -and $reporter.StartTime -ge $started) {
+                    $shutdownCrashDetected = $true
+                    # Never submit a report or invoke its default UI action.
+                    $reporter.Kill()
+                    if (-not $reporter.WaitForExit(5000)) { throw 'Owned Deep Rock crash reporter did not exit.' }
+                }
+            } catch { $processesStopped = $false; $cleanupErrors += $_.Exception.Message }
+        }
+        if ($shutdownCrashDetected) { $cleanupErrors += 'Deep Rock produced a crash reporter during this run; measurement evidence is retained, but teardown was not clean.' }
+    }
     foreach ($item in @(@($logPath,'log.txt'), @($resultPath,'benchmark-result.txt'), @($config,'config.after.txt'))) {
         try {
             if (Test-Path -LiteralPath $item[0]) { Copy-Item -LiteralPath $item[0] -Destination (Join-Path $runDir $item[1]) }
@@ -229,6 +251,7 @@ try {
         fixed_scale=$FixedScale; native_percentage=$NativePercentage; warmup_seconds=$WarmupSeconds; measure_seconds=$MeasureSeconds
         capture_frames=[bool]$CaptureFrames
         package=$Package; backend_sha256=$backendHash; processes_stopped=$processesStopped
+        shutdown_crash_detected=$shutdownCrashDetected
         config_restored=$configRestored; frontend_restored=$frontendRestored
         matched_crop_probe_samples=$matchedSamples; image_correctness_verified=$false
         scoped_gpu_timing_samples=$gpuSamples; whole_game_performance_measured=$false

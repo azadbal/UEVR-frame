@@ -3,6 +3,7 @@
 #include <unordered_set>
 #include <deque>
 #include <atomic>
+#include <chrono>
 
 #include <d3d11.h>
 #include <d3d12.h>
@@ -74,6 +75,37 @@ struct OpenXR final : public VRRuntime {
     void on_pre_render_rhi_thread(uint32_t frame_count) override {};
 
     VRRuntime::Error synchronize_frame(std::optional<uint32_t> frame_count = std::nullopt) override;
+
+    // Accessed only under sync_mtx; no additional synchronization or runtime calls.
+    struct RuntimeTimingSample {
+        std::chrono::steady_clock::time_point start{};
+        int64_t wall_start_us{0};
+        uint32_t frame{0};
+        const char* frame_kind{"unknown"};
+        bool enabled{false}, retry{false};
+    };
+    struct RuntimeTimingStat {
+        uint32_t count{0}, failures{0}, retries{0}, slow{0};
+        uint32_t first_frame{0}, last_frame{0};
+        double sum{0}, maximum{0};
+        RuntimeTimingSample maximum_sample{};
+        int64_t maximum_end_us{0};
+        XrResult maximum_result{XR_SUCCESS};
+        XrDuration maximum_period{0};
+    };
+    struct RuntimeTiming {
+        std::array<RuntimeTimingStat, 3> calls{};
+        std::chrono::steady_clock::time_point report{};
+        int64_t report_wall_us{0};
+        uint64_t epoch{0};
+        uint32_t settings{0}, fixed_scale_bits{0}, transition_skips{0};
+        bool enabled{false};
+    } runtime_timing{};
+    uint32_t runtime_timing_settings() const;
+    RuntimeTimingSample start_runtime_timing(uint32_t frame, const char* frame_kind, bool retry = false);
+    void finish_runtime_timing(uint32_t boundary, const RuntimeTimingSample& sample, XrResult result, const XrFrameState& state);
+    void report_runtime_timing(std::chrono::steady_clock::time_point now);
+
     VRRuntime::Error fix_frame() override {
         // sync if necessary.
         VRRuntime::fix_frame();

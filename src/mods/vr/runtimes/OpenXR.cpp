@@ -1,6 +1,7 @@
 #include <Windows.h>
 #include <TlHelp32.h>
 #include <chrono>
+#include <bit>
 #include <filesystem>
 #include <fstream>
 
@@ -118,6 +119,119 @@ void OpenXR::on_pre_render_game_thread(uint32_t frame_count) {
     this->pipeline_states[frame_count % OpenXR::QUEUE_SIZE].frame_count = frame_count;
 }
 
+uint32_t OpenXR::runtime_timing_settings() const {
+    const auto& vr = VR::get();
+    return uint32_t(vr->get_volumetric_frame_setting()) |
+        (uint32_t(vr->get_frame_crop_setting()) << 1) |
+        (uint32_t(vr->get_frame_pixel_reduction_setting()) << 2) |
+        (uint32_t(vr->is_native_stereo_fix_enabled()) << 3) |
+        (uint32_t(vr->is_frame_capture_requested()) << 4) |
+        (uint32_t(vr->is_using_afr()) << 5) |
+        (uint32_t(should_push_dummy_projection()) << 6) |
+        (uint32_t(vr->get_synchronize_stage()) << 8);
+}
+
+OpenXR::RuntimeTimingSample OpenXR::start_runtime_timing(uint32_t frame, const char* frame_kind, bool retry) {
+    const auto& vr = VR::get();
+    const bool enabled = vr->is_frame_diagnostics_enabled();
+    auto& timing = runtime_timing;
+    if (!enabled && !timing.enabled) return {};
+    const auto settings = runtime_timing_settings();
+    const auto fixed_scale_bits = std::bit_cast<uint32_t>(vr->get_frame_fixed_view_scale());
+    if (timing.enabled != enabled || timing.settings != settings || timing.fixed_scale_bits != fixed_scale_bits) {
+        const auto now = std::chrono::steady_clock::now();
+        if (timing.enabled) report_runtime_timing(now);
+        timing.calls = {};
+        timing.report = now;
+        timing.report_wall_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        timing.settings = settings;
+        timing.fixed_scale_bits = fixed_scale_bits;
+        timing.enabled = enabled;
+        ++timing.epoch;
+    }
+    if (!enabled) return {};
+    RuntimeTimingSample sample{};
+    sample.frame = frame;
+    sample.frame_kind = frame_kind;
+    sample.retry = retry;
+    sample.enabled = true;
+    sample.wall_start_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    sample.start = std::chrono::steady_clock::now();
+    return sample;
+}
+
+void OpenXR::finish_runtime_timing(uint32_t boundary, const RuntimeTimingSample& sample,
+    XrResult result, const XrFrameState& state) {
+    if (!sample.enabled) return;
+    const auto end = std::chrono::steady_clock::now();
+    const auto wall_end_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const double ms = std::chrono::duration<double, std::milli>(end - sample.start).count();
+    auto& timing = runtime_timing;
+    const auto& vr = VR::get();
+    // A settings change while a blocking runtime call was in progress belongs
+    // to neither steady mode; omit it rather than attributing it to one side.
+    if (!vr->is_frame_diagnostics_enabled() || timing.settings != runtime_timing_settings() ||
+        timing.fixed_scale_bits != std::bit_cast<uint32_t>(vr->get_frame_fixed_view_scale())) {
+        ++timing.transition_skips;
+        return;
+    }
+    auto& stat = timing.calls[boundary];
+    if (stat.count == 0) stat.first_frame = sample.frame;
+    stat.last_frame = sample.frame;
+    ++stat.count;
+    stat.failures += XR_FAILED(result);
+    stat.retries += sample.retry;
+    stat.sum += ms;
+    if (stat.count == 1 || ms > stat.maximum) {
+        stat.maximum = ms;
+        stat.maximum_sample = sample;
+        stat.maximum_end_us = wall_end_us;
+        stat.maximum_result = result;
+        stat.maximum_period = state.predictedDisplayPeriod;
+    }
+    const double slow_ms = state.predictedDisplayPeriod > 0 && state.predictedDisplayPeriod < 1000000000
+        ? 2.0 * double(state.predictedDisplayPeriod) / 1e6 : 20.0;
+    constexpr uint32_t slow_log_limit = 4;
+    const char* names[]{"xrWaitFrame", "xrBeginFrame", "xrEndFrame"};
+    if (ms >= slow_ms && ++stat.slow <= slow_log_limit) {
+        spdlog::info("[Frame Pacing] kind=slow scope=openxr_cpu_call call={} epoch={} frame={} frame_kind={} retry={} result={} elapsed_ms={:.4f} wall_start_us={} wall_end_us={} steady_start_us={} steady_end_us={} predicted_period_ms={:.4f} should_render={} slow_threshold_ms={:.4f} settings_bits={} fixed_scale={} settings=requested",
+            names[boundary], timing.epoch, sample.frame, sample.frame_kind, uint32_t(sample.retry), int32_t(result), ms,
+            sample.wall_start_us, wall_end_us,
+            std::chrono::duration_cast<std::chrono::microseconds>(sample.start.time_since_epoch()).count(),
+            std::chrono::duration_cast<std::chrono::microseconds>(end.time_since_epoch()).count(),
+            double(state.predictedDisplayPeriod) / 1e6, state.shouldRender, slow_ms, timing.settings,
+            std::bit_cast<float>(timing.fixed_scale_bits));
+    }
+    if (end - timing.report >= std::chrono::seconds(2)) report_runtime_timing(end);
+}
+
+void OpenXR::report_runtime_timing(std::chrono::steady_clock::time_point now) {
+    auto& timing = runtime_timing;
+    const auto wall_end_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const char* names[]{"xrWaitFrame", "xrBeginFrame", "xrEndFrame"};
+    for (uint32_t i = 0; i < timing.calls.size(); ++i) {
+        const auto& stat = timing.calls[i];
+        if (stat.count == 0) continue;
+        spdlog::info("[Frame Pacing] kind=summary scope=openxr_cpu_call call={} epoch={} interval_s={:.3f} wall_start_us={} wall_end_us={} n={} avg_ms={:.4f} max_ms={:.4f} failures={} retries={} slow_n={} slow_logged={} transition_skips={} slow_threshold=2x_period_or_20ms frame_first={} frame_last={} max_frame={} max_frame_kind={} max_retry={} max_result={} max_wall_start_us={} max_wall_end_us={} max_predicted_period_ms={:.4f} frame_enabled={} crop_setting={} reduce_setting={} native_fix={} capture={} afr={} vd_dummy={} sync_stage={} fixed_scale={} settings=requested excludes=gpu_time,uevr_lock_wait,layer_preparation,swapchain_acquire_wait_release",
+            names[i], timing.epoch, std::chrono::duration<double>(now - timing.report).count(), timing.report_wall_us, wall_end_us, stat.count,
+            stat.sum / stat.count, stat.maximum, stat.failures, stat.retries, stat.slow, std::min(stat.slow, 4u), timing.transition_skips,
+            stat.first_frame, stat.last_frame, stat.maximum_sample.frame, stat.maximum_sample.frame_kind,
+            uint32_t(stat.maximum_sample.retry), int32_t(stat.maximum_result), stat.maximum_sample.wall_start_us,
+            stat.maximum_end_us, double(stat.maximum_period) / 1e6,
+            timing.settings & 1, (timing.settings >> 1) & 1, (timing.settings >> 2) & 1,
+            (timing.settings >> 3) & 1, (timing.settings >> 4) & 1, (timing.settings >> 5) & 1,
+            (timing.settings >> 6) & 1, timing.settings >> 8, std::bit_cast<float>(timing.fixed_scale_bits));
+    }
+    timing.calls = {};
+    timing.transition_skips = 0;
+    timing.report = now;
+    timing.report_wall_us = wall_end_us;
+}
+
 VRRuntime::Error OpenXR::synchronize_frame(std::optional<uint32_t> frame_count) {
     std::scoped_lock _{sync_mtx};
 
@@ -140,7 +254,10 @@ VRRuntime::Error OpenXR::synchronize_frame(std::optional<uint32_t> frame_count) 
 
     XrFrameWaitInfo frame_wait_info{XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState local_frame_state{XR_TYPE_FRAME_STATE};
+    const auto timing = start_runtime_timing(frame_count.value_or(this->internal_render_frame_count),
+        frame_count ? "requested" : "render_snapshot");
     auto result = xrWaitFrame(this->session, &frame_wait_info, &local_frame_state);
+    finish_runtime_timing(0, timing, result, local_frame_state);
 
     this->end_profile("xrWaitFrame");
 
@@ -682,6 +799,8 @@ void OpenXR::destroy() {
     }
 
     std::scoped_lock _{sync_mtx};
+    if (runtime_timing.enabled) report_runtime_timing(std::chrono::steady_clock::now());
+    runtime_timing.enabled = false;
 
     if (this->session != nullptr) {
         if (this->session_ready) {
@@ -1825,7 +1944,9 @@ XrResult OpenXR::begin_frame() {
     this->begin_profile();
 
     XrFrameBeginInfo frame_begin_info{XR_TYPE_FRAME_BEGIN_INFO};
+    auto timing = start_runtime_timing(this->internal_render_frame_count, "render_snapshot");
     auto result = xrBeginFrame(this->session, &frame_begin_info);
+    finish_runtime_timing(1, timing, result, this->frame_state);
 
     this->end_profile("xrBeginFrame");
 
@@ -1835,7 +1956,9 @@ XrResult OpenXR::begin_frame() {
 
     if (result == XR_ERROR_CALL_ORDER_INVALID) {
         synchronize_frame();
+        timing = start_runtime_timing(this->internal_render_frame_count, "render_snapshot", true);
         result = xrBeginFrame(this->session, &frame_begin_info);
+        finish_runtime_timing(1, timing, result, this->frame_state);
     }
 
     this->frame_began = result == XR_SUCCESS || result == XR_FRAME_DISCARDED; // discarded means endFrame was not called
@@ -2053,7 +2176,9 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
     //spdlog::info("[VR] Ending frame, layer ptr: {:x}", (uintptr_t)frame_end_info.layers);
 
     this->begin_profile();
+    const auto timing = start_runtime_timing(submit_state.frame_count, "submitted");
     auto result = xrEndFrame(this->session, &frame_end_info);
+    finish_runtime_timing(2, timing, result, pipelined_frame_state);
     this->end_profile("xrEndFrame");
     
     if (result != XR_SUCCESS) {
