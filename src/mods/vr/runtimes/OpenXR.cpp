@@ -25,9 +25,11 @@ void OpenXR::on_draw_ui() {
     ImGui::SetNextItemOpen(true, ImGuiCond_Once);
     if (ImGui::TreeNode("OpenXR Options")) {
         this->resolution_scale->draw("Resolution Scale");
-        //this->push_dummy_projection->draw("Virtual Desktop Fix");
-
-        ImGui::Checkbox("Virtual Desktop Fix", &this->push_dummy_projection);
+        this->virtual_desktop_fix_override->draw("Virtual Desktop Fix Override");
+        ImGui::BeginDisabled(this->virtual_desktop_fix_override->value() != 0);
+        bool vd_fix = this->should_push_dummy_projection();
+        if (ImGui::Checkbox("Virtual Desktop Fix", &vd_fix)) this->push_dummy_projection = vd_fix;
+        ImGui::EndDisabled();
 
         ImGui::SameLine();
 
@@ -793,6 +795,7 @@ void OpenXR::prepare_frame_probe() {
     probe.crop_requested = vr->is_frame_crop_requested() && !captured.frame_crop_lost &&
         vr->d3d12().frame_crop_ready(probe.width, probe.height);
     probe.reduce_pixels_requested = probe.crop_requested && vr->is_frame_pixel_reduction_requested();
+    probe.fixed_view_scale = vr->get_frame_fixed_view_scale();
     probe.green = vr->is_volumetric_frame_green();
     probe.bounds = bounds;
     probe.prepared = true;
@@ -1901,7 +1904,7 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
     // Dummy projection layers for Virtual Desktop. If we don't do this, timewarp does not work correctly on VD.
     // the reasoning from ggodin (VD dev) is that VD composites all layers using the top layer's pose (apparently)
     // I am actually not sure why this fixes the issue, but it does. and even makes the SteamVR overlay work completely fine.
-    const auto should_push_dummy = this->push_dummy_projection == true && 
+    const auto should_push_dummy = this->should_push_dummy_projection() &&
                                    !pipelined_stage_views.empty() && 
                                    this->ever_submitted == true;
 

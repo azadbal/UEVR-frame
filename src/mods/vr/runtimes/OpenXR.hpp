@@ -328,12 +328,18 @@ public:
     
     const ModSlider::Ptr resolution_scale{ ModSlider::create("OpenXR_ResolutionScale", 0.1f, 3.0f, 1.0f) };
     const ModToggle::Ptr ignore_vd_checks{ ModToggle::create("OpenXR_IgnoreVirtualDesktopChecks", false) };
+    const ModCombo::Ptr virtual_desktop_fix_override{ ModCombo::create("OpenXR_VirtualDesktopFixOverride", {"Auto", "Force On", "Force Off"}) };
     bool push_dummy_projection{ false };
+    bool should_push_dummy_projection() const {
+        const auto mode = virtual_desktop_fix_override->value();
+        return mode == 1 || (mode != 2 && push_dummy_projection);
+    }
     bool ever_submitted{false};
     
     Mod::ValueList options{
         *resolution_scale,
         *ignore_vd_checks,
+        *virtual_desktop_fix_override,
     };
 
     enum class SwapchainIndex {

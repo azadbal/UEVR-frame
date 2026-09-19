@@ -2439,6 +2439,12 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                     spdlog::info("[Frame Perf] setting ReduceScenePixels={}", m_volumetric_frame_reduce_pixels->value());
                 }
                 ImGui::TextWrapped("Renders only the crop's pixel dimensions inside the existing textures. Headset output resolution stays unchanged. Off keeps the previous full-resolution crop test.");
+                if (m_volumetric_frame_reduce_pixels->value()) {
+                    if (m_volumetric_frame_fixed_view_scale->draw("Fixed View Scale (Diagnostic)")) {
+                        spdlog::info("[Frame Perf] setting FixedViewScale={}", m_volumetric_frame_fixed_view_scale->value());
+                    }
+                    ImGui::TextWrapped("0 keeps exact crop sizes. 0.1 to 1 fixes both eyes to this fraction of full width and height. The aperture follows your head; sampling quality can change. Other values use exact crop sizes.");
+                }
             }
             if (const auto blocker = frame_crop_block_reason()) {
                 ImGui::TextWrapped("Optimization: Inactive (%s)", blocker);

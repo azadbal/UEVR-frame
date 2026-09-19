@@ -3,6 +3,7 @@
 #include <span>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <glm/glm.hpp>
 
 #include <d3d12.h>
@@ -68,6 +69,17 @@ public:
     bool frame_crop_failed() const { return m_frame_resolve_failed.load() || m_frame_mask_failed.load(); }
 
 private:
+    struct SubmissionSample {
+        uint32_t frame{0}, pose{0}, probe{0}, cropped{0}, reduced{0}, mask_drawn{0};
+        uint64_t generation{0};
+        float fixed_view_scale{0};
+        bool lost{false}, resolved{false}, suppressed{false};
+        uint64_t key() const {
+            return cropped | (reduced << 2) | (uint32_t(lost) << 4) |
+                (uint32_t(resolved) << 5) | (uint32_t(suppressed) << 6) | (mask_drawn << 7) |
+                (uint64_t(std::bit_cast<uint32_t>(fixed_view_scale)) << 32);
+        }
+    };
     bool setup();
     std::unique_ptr<DirectX::DX12::SpriteBatch> setup_sprite_batch_pso(
         DXGI_FORMAT output_format, 
@@ -77,11 +89,13 @@ private:
 
     void draw_spectator_view(ID3D12GraphicsCommandList* command_list, bool is_right_eye_frame);
     void clear_backbuffer();
-    void draw_volumetric_frame(d3d12::TextureContext& target, ID3D12Resource* resource, ID3D12Resource* source);
+    void draw_volumetric_frame(d3d12::TextureContext& target, ID3D12Resource* resource, ID3D12Resource* source,
+        SubmissionSample* sample = nullptr);
     bool setup_volumetric_frame(ID3D12Device* device);
     bool setup_frame_resolve(ID3D12Device* device);
     bool resolve_volumetric_frame(d3d12::TextureContext& target, d3d12::TextureContext* scratch,
-        ID3D12Resource* source, D3D12_RESOURCE_STATES source_state, bool direct_copy);
+        ID3D12Resource* source, D3D12_RESOURCE_STATES source_state, bool direct_copy,
+        ID3D12QueryHeap* queries = nullptr, SubmissionSample* sample = nullptr);
     void reset_volumetric_frame_anchor();
     void report_frame_crop(VolumetricFrameResolveResult result, uint32_t cropped, uint32_t reduced,
         const char* reason, uint32_t frame);
@@ -255,25 +269,54 @@ private:
         };
 
         struct SubmissionTiming {
+            // Boundaries: pre, copy start/end (inside reconstruction), reconstruction,
+            // additional commands, mask. Read only after the existing image fence.
+            static constexpr uint32_t query_count = 7;
             ComPtr<ID3D12QueryHeap> queries{};
             ComPtr<ID3D12Resource> readback{};
             ComPtr<ID3D12Fence> fence{};
             uint64_t fence_value{0}, frequency{0};
-            bool unavailable{false}, mask_enabled{false};
+            bool unavailable{false};
+            uint64_t epoch{0};
+            SubmissionSample sample{};
             bool begin(d3d12::CommandContext& commands);
+        };
+
+        struct TimingInterval {
+            TimingStat gpu_pre{}, gpu_copy{}, gpu_reconstruct{}, gpu_additional{}, gpu_mask{};
+            TimingStat cpu_fence_wait{}, cpu_record{}, cpu_execute{};
+            SubmissionSample first{}, last{};
+            void source(const SubmissionSample& sample) {
+                if (gpu_copy.count == 0) first = sample;
+                last = sample;
+            }
+        };
+
+        struct SubmissionCapture {
+            ComPtr<ID3D12Resource> readback{};
+            ComPtr<ID3D12Fence> fence{};
+            uint64_t fence_value{0}, bytes{0};
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+            SubmissionSample sample{};
+            bool abandoned{false}, rgba{false};
+            bool begin(d3d12::CommandContext& commands, ID3D12Resource* source, const SubmissionSample& source_sample);
+            bool finish();
         };
 
         struct SwapchainContext {
             // One query/readback set per output image, protected by its submission fence.
             // Declared first so command contexts are destroyed before timing resources.
             std::vector<SubmissionTiming> timings{};
+            SubmissionCapture capture{};
             std::vector<XrSwapchainImageD3D12KHR> textures{};
             std::vector<std::unique_ptr<d3d12::TextureContext>> texture_contexts{};
             // Used only by DOUBLE_WIDE. Each scratch shares its output's command fence.
             std::vector<std::unique_ptr<d3d12::TextureContext>> frame_scratch{};
-            TimingStat gpu_copy{}, gpu_mask{}, cpu_fence_wait{}, cpu_record_execute{};
-            uint32_t timing_pending{0}, timing_invalid{0};
-            bool timing_enabled{false}, timing_mask_enabled{false};
+            std::unordered_map<uint64_t, TimingInterval> timing_intervals{};
+            uint32_t timing_pending{0}, timing_invalid{0}, timing_stale{0};
+            uint32_t timing_settings{~0u};
+            uint32_t timing_fixed_scale_bits{0};
+            uint64_t timing_epoch{0};
             std::chrono::steady_clock::time_point timing_report{};
             uint32_t num_textures_acquired{0};
             uint32_t last_acquired_texture{0};

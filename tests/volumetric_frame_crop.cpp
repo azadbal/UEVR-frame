@@ -62,6 +62,77 @@ void projection_test() {
         "Invalid crop must preserve baseline projection");
 }
 
+void fixed_view_diagnostic_test() {
+    const int width = 2053, height = 1999;
+    auto ready = [&](float scale) {
+        VolumetricFrameProbe probe{};
+        probe.prepared = probe.layout.active = probe.crop_requested = probe.reduce_pixels_requested = true;
+        probe.width = width;
+        probe.height = height;
+        probe.fixed_view_scale = scale;
+        probe.crops = {{{{101, 201, 901, 801}, VolumetricFrameCropFallback::NONE},
+                        {{82, 212, 887, 793}, VolumetricFrameCropFallback::NONE}}};
+        return probe;
+    };
+    // Successive live crops retain different projections but share a constant source size.
+    for (int frame = 0; frame < 4; ++frame) {
+        auto probe = ready(0.75f);
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            probe.crops[eye].rect.width += frame * 19;
+            probe.crops[eye].rect.height += frame * 13;
+            probe.crops[eye].rect.x += frame * 7;
+            const auto crop = probe.crops[eye].rect;
+            bool lost = false;
+            const VolumetricFramePixelRect baseline{(int)eye * width, 0, width, height};
+            const auto actual = probe.record_view_rect(eye, baseline, lost);
+            require(equal(actual, {(int)eye * width, 0, 1540, 1500}), "Fixed shared dimensions changed with live crop");
+            require(probe.can_crop(eye) && probe.apply_projection_crop(eye, lost) && !lost,
+                "Validated fixed source dimensions rejected live crop");
+            require(equal(probe.crops[eye].rect, crop), "Fixed view froze or replaced live crop");
+            probe.reduce_pixels_requested = false;
+            require(equal(probe.record_view_rect(eye, baseline, lost), actual), "Repeated callback lost fixed source size");
+            probe.reduce_pixels_requested = true;
+            // A ray at a known full-eye pixel must resolve back to that pixel even
+            // when the fixed source and live output crop have different dimensions.
+            const double pixel_x = crop.x + crop.width * 0.37;
+            const double pixel_y = crop.y + crop.height * 0.61;
+            const auto projection = crop_volumetric_frame_projection(glm::dmat4{1}, crop, width, height);
+            const auto clip = projection * glm::dvec4{2 * pixel_x / width - 1, 1 - 2 * pixel_y / height, 0, 1};
+            const double source_x = actual.x + (clip.x + 1) * actual.width / 2;
+            const double source_y = actual.y + (1 - clip.y) * actual.height / 2;
+            close(crop.x + (source_x - actual.x) / actual.width * crop.width, pixel_x);
+            close(crop.y + (source_y - actual.y) / actual.height * crop.height, pixel_y);
+            probe.scene_rects[eye].width -= 1;
+            require(!probe.can_crop(eye), "Unexpected fixed source extent accepted");
+            probe.scene_rects[eye] = actual;
+            probe.scene_rects[eye].x += 1;
+            require(!probe.can_crop(eye), "Unexpected fixed source packing accepted");
+            probe.scene_rects[eye] = actual;
+        }
+    }
+    for (float scale : {0.0f, -1.0f, 0.05f, 1.01f, std::numeric_limits<float>::infinity(),
+                       std::numeric_limits<float>::quiet_NaN()}) {
+        auto probe = ready(scale);
+        bool lost = false;
+        require(equal(probe.record_view_rect(0, {0, 0, width, height}, lost), {0, 0, 901, 801}) &&
+            probe.apply_projection_crop(0, lost), "Default/invalid fixed scale changed exact-crop behavior");
+    }
+    auto full = ready(1.0f);
+    bool lost = false;
+    require(equal(full.record_view_rect(0, {0, 0, width, height}, lost), {0, 0, width, height}) &&
+        full.apply_projection_crop(0, lost) && full.reduced_mask == 0, "Fixed scale 1 lost crop-only comparator");
+    auto minimum = ready(0.1f);
+    require(equal(minimum.reduced_view_rect(0), {0, 0, 206, 200}), "Minimum fixed scale rounding changed");
+    auto disabled = ready(0.75f);
+    disabled.reduce_pixels_requested = false;
+    require(equal(disabled.record_view_rect(0, {0, 0, width, height}, lost), {0, 0, width, height}),
+        "Fixed scale changed views with reduction disabled");
+    auto fallback = ready(0.75f);
+    fallback.crops[0].fallback = VolumetricFrameCropFallback::EYE_PLANE;
+    require(equal(fallback.record_view_rect(0, {0, 0, width, height}, lost), {0, 0, width, height}) &&
+        !fallback.apply_projection_crop(0, lost), "Fixed sizing bypassed crop fallback validation");
+}
+
 void view_transition_test() {
     const int width = 2053, height = 1999;
     const std::array<VolumetricFramePixelRect, 2> full{{{0, 0, width, height}, {width, 0, width, height}}};
@@ -367,6 +438,7 @@ int main() try {
     projection_test<float>();
     projection_test<double>();
     view_transition_test();
+    fixed_view_diagnostic_test();
     submission_recovery_test();
     native_clone_submission_test();
     std::puts("PASS: crop geometry, view decisions, fail-closed submission, source identity, native clone validation and recovery");

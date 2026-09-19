@@ -50,6 +50,7 @@ struct VolumetricFrameProbe {
     uint32_t rect_mask{0};
     bool crop_requested{false};
     bool reduce_pixels_requested{false};
+    float fixed_view_scale{0.0f}; // Diagnostic source size, captured once per pose; zero keeps exact crop sizing.
     bool reduce_pixels_blocked{false}; // No usable pose at the first view callback.
     bool green{false};
     uint32_t cropped_mask{0}; // Only eyes whose returned projection was changed.
@@ -89,6 +90,14 @@ struct VolumetricFrameProbe {
         return eye < 2 && rect.x == (int)eye * width && rect.y == 0 && rect.width == width && rect.height == height;
     }
 
+    VolumetricFramePixelRect reduced_view_rect(uint32_t eye) const {
+        if (eye >= 2 || width <= 0 || height <= 0) return {};
+        const bool fixed = std::isfinite(fixed_view_scale) && fixed_view_scale >= 0.1f && fixed_view_scale <= 1.0f;
+        return {(int)eye * width, 0,
+            fixed ? (int)std::ceil((double)width * fixed_view_scale) : crops[eye].rect.width,
+            fixed ? (int)std::ceil((double)height * fixed_view_scale) : crops[eye].rect.height};
+    }
+
     VolumetricFramePixelRect record_view_rect(uint32_t eye, VolumetricFramePixelRect incoming, bool& lost) {
         if (eye >= 2) return incoming;
         const uint32_t bit = 1u << eye;
@@ -103,8 +112,7 @@ struct VolumetricFrameProbe {
         auto actual = incoming;
         if (!(rect_mask & bit) && !lost && !reduce_pixels_blocked && reduce_pixels_requested && valid_crop(eye) &&
             baseline_rect(eye, incoming) && (!(crop_decision_mask & bit) || (cropped_mask & bit))) {
-            actual.width = crops[eye].rect.width;
-            actual.height = crops[eye].rect.height;
+            actual = reduced_view_rect(eye);
             if (actual.width != width || actual.height != height) reduced_mask |= bit;
         }
         scene_rects[eye] = actual;
@@ -116,8 +124,10 @@ struct VolumetricFrameProbe {
         if (!valid_crop(eye) || !(rect_mask & (1u << eye))) return false;
         const auto& rect = scene_rects[eye];
         if (!(reduced_mask & (1u << eye))) return baseline_rect(eye, rect);
+        const auto expected = reduced_view_rect(eye);
         return rect.x == (int)eye * width && rect.y == 0 &&
-            rect.width == crops[eye].rect.width && rect.height == crops[eye].rect.height;
+            rect.width > 0 && rect.width <= width && rect.height > 0 && rect.height <= height &&
+            rect.width == expected.width && rect.height == expected.height;
     }
 
     bool apply_projection_crop(uint32_t eye, bool& lost) {

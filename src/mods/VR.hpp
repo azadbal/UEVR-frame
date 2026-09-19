@@ -600,6 +600,8 @@ public:
         return is_frame_crop_requested() && m_volumetric_frame_reduce_pixels->value();
     }
 
+    float get_frame_fixed_view_scale() const { return m_volumetric_frame_fixed_view_scale->value(); }
+
     bool is_game_ui_following_frame() const {
         return is_volumetric_frame_enabled() && m_volumetric_frame_move_ui->value() && m_volumetric_frame_layout.active;
     }
@@ -938,6 +940,8 @@ private:
     const ModToggle::Ptr m_volumetric_frame_diagnostics{ ModToggle::create(generate_name("VolumetricFrameDiagnostics"), false) };
     const ModToggle::Ptr m_volumetric_frame_crop{ ModToggle::create(generate_name("VolumetricFrameCrop"), false) };
     const ModToggle::Ptr m_volumetric_frame_reduce_pixels{ ModToggle::create(generate_name("VolumetricFrameReducePixels"), false) };
+    const ModSlider::Ptr m_volumetric_frame_fixed_view_scale{ ModSlider::create(generate_name("VolumetricFrameFixedViewScale"), 0.0f, 1.0f, 0.0f) };
+    const ModToggle::Ptr m_volumetric_frame_capture{ ModToggle::create(generate_name("VolumetricFrameCapture"), false) };
     const ModToggle::Ptr m_roomscale_movement{ ModToggle::create(generate_name("RoomscaleMovement"), false) };
     const ModToggle::Ptr m_roomscale_sweep{ ModToggle::create(generate_name("RoomscaleMovementSweep"), true) };
     const ModToggle::Ptr m_swap_controllers{ ModToggle::create(generate_name("SwapControllerInputs"), false) };
@@ -1093,6 +1097,8 @@ public:
             *m_volumetric_frame_diagnostics,
             *m_volumetric_frame_crop,
             *m_volumetric_frame_reduce_pixels,
+            *m_volumetric_frame_fixed_view_scale,
+            *m_volumetric_frame_capture,
             *m_roomscale_movement,
             *m_roomscale_sweep,
             *m_swap_controllers,

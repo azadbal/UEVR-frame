@@ -1,5 +1,6 @@
 #include <d3dcompiler.h>
 #include <cmath>
+#include <fstream>
 
 #include <openvr.h>
 #include <utility/String.hpp>
@@ -118,10 +119,21 @@ bool D3D12Component::setup_frame_resolve(ID3D12Device* device) {
 }
 
 bool D3D12Component::resolve_volumetric_frame(d3d12::TextureContext& target, d3d12::TextureContext* scratch,
-    ID3D12Resource* source, D3D12_RESOURCE_STATES source_state, bool direct_copy) {
+    ID3D12Resource* source, D3D12_RESOURCE_STATES source_state, bool direct_copy,
+    ID3D12QueryHeap* queries, SubmissionSample* sample) {
     auto& vr = VR::get();
     const auto state = vr->m_openxr->get_submit_state(false);
     const auto& probe = state.frame_probe;
+    if (sample != nullptr) {
+        sample->frame = state.frame_count;
+        sample->pose = state.pose_frame_count;
+        sample->probe = probe.pose_frame;
+        sample->generation = state.pose_generation;
+        sample->fixed_view_scale = probe.fixed_view_scale;
+        sample->cropped = probe.cropped_mask;
+        sample->reduced = probe.reduced_mask;
+        sample->lost = state.frame_crop_lost;
+    }
     m_frame_submission_suppressed = false;
     m_frame_submission_resolved = false;
     if (probe.cropped_mask == 0 && probe.reduced_mask == 0 && !state.frame_crop_lost) {
@@ -197,7 +209,9 @@ bool D3D12Component::resolve_volumetric_frame(d3d12::TextureContext& target, d3d
         report_frame_crop(result, 0, 0, reason, state.frame_count);
         return true;
     }
+    if (queries != nullptr) list->EndQuery(queries, D3D12_QUERY_TYPE_TIMESTAMP, 2);
     target.commands.copy(source, scratch->texture.Get(), source_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (queries != nullptr) list->EndQuery(queries, D3D12_QUERY_TYPE_TIMESTAMP, 3);
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     list->SetGraphicsRootSignature(m_frame_resolve_root.Get());
     list->SetPipelineState(m_frame_resolve_pipeline.Get());
@@ -338,7 +352,8 @@ VolumetricFrameLayout D3D12Component::prepare_volumetric_frame(const std::array<
     return {frame_pose, frame_size, true};
 }
 
-void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12Resource* resource, ID3D12Resource* source) {
+void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12Resource* resource, ID3D12Resource* source,
+    SubmissionSample* sample) {
     auto& vr = VR::get();
     // Peek without consuming the render-frame association needed by xrEndFrame.
     const auto state = vr->m_openxr->get_submit_state(false);
@@ -487,6 +502,7 @@ void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12
         list->RSSetScissorRects(1, &scissor);
         list->SetGraphicsRoot32BitConstants(0, 32, constants.data(), 0);
         list->DrawInstanced(3, 1, 0, 0);
+        if (sample != nullptr) sample->mask_drawn |= 1u << i;
     }
     target.commands.has_commands = true;
     if (m_frame_submission_resolved) {
@@ -1855,6 +1871,12 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
     auto backbuffer_desc = backbuffer->GetDesc();
     auto& openxr = vr->m_openxr;
 
+    for (const auto& [index, context] : this->contexts) {
+        if (context.capture.readback != nullptr) {
+            spdlog::error("[Frame Capture] failed reason=swapchain-recreated frame={}", context.capture.sample.frame);
+            vr->m_volumetric_frame_capture->value() = false;
+        }
+    }
     this->contexts.clear();
 
     auto create_swapchain = [&](uint32_t i, const XrSwapchainCreateInfo& swapchain_create_info, const D3D12_RESOURCE_DESC& desc) -> std::optional<std::string> {
@@ -1953,7 +1975,8 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
     standard_swapchain_create_info.mipCount = 1;
     standard_swapchain_create_info.faceCount = 1;
     standard_swapchain_create_info.sampleCount = backbuffer_desc.SampleDesc.Count;
-    standard_swapchain_create_info.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    standard_swapchain_create_info.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+        XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT;
 
     auto hmd_desc = backbuffer_desc;
     hmd_desc.Width = vr->get_hmd_width() * double_wide_multiple;
@@ -2128,6 +2151,11 @@ void D3D12Component::OpenXR::destroy_swapchains() {
         auto& ctx = it.second;
         const auto i = it.first;
 
+        if (ctx.capture.readback != nullptr) {
+            spdlog::error("[Frame Capture] failed reason=swapchain-destroyed frame={}", ctx.capture.sample.frame);
+            vr->m_volumetric_frame_capture->value() = false;
+        }
+
         //ctx.texture_contexts.clear();
         for (auto& texture_context : ctx.texture_contexts) {
             if (texture_context != nullptr) {
@@ -2174,6 +2202,138 @@ void D3D12Component::OpenXR::destroy_swapchains() {
     vr->m_openxr->swapchains.clear();
 }
 
+bool D3D12Component::OpenXR::SubmissionCapture::begin(d3d12::CommandContext& commands,
+    ID3D12Resource* source, const SubmissionSample& source_sample) {
+    const auto desc = source->GetDesc();
+    const bool bgra = desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+        desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    rgba = desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+        desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    if (!commands.ready() || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        desc.SampleDesc.Count != 1 || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 ||
+        (!bgra && !rgba)) {
+        spdlog::error("[Frame Capture] failed reason=unsupported-output ready={} dimension={} format={} samples={} quality={} array={} mips={} size={}x{} flags={}",
+            commands.ready(), uint32_t(desc.Dimension), uint32_t(desc.Format), desc.SampleDesc.Count, desc.SampleDesc.Quality,
+            desc.DepthOrArraySize, desc.MipLevels, desc.Width, desc.Height, uint32_t(desc.Flags));
+        return false;
+    }
+    auto device = g_framework->get_d3d12_hook()->get_device();
+    device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
+    // Bound this diagnostic allocation even if an accidental request arrives at extreme resolution.
+    if (bytes == 0 || bytes > 1024ull * 1024 * 1024) {
+        spdlog::error("[Frame Capture] failed reason=readback-size bytes={}", bytes);
+        return false;
+    }
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = bytes;
+    buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    const auto result = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback));
+    if (FAILED(result)) {
+        spdlog::error("[Frame Capture] failed reason=readback-allocation hr={:x} bytes={}", uint32_t(result), bytes);
+        return false;
+    }
+    D3D12_TEXTURE_COPY_LOCATION from{};
+    from.pResource = source;
+    from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION to{};
+    to.pResource = readback.Get();
+    to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    to.PlacedFootprint = footprint;
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = source;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    commands.cmd_list->ResourceBarrier(1, &barrier);
+    commands.cmd_list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    commands.cmd_list->ResourceBarrier(1, &barrier);
+    commands.has_commands = true;
+    fence = commands.fence;
+    fence_value = commands.fence_value + 1;
+    sample = source_sample;
+    spdlog::info("[Frame Capture] queued frame={} pose={} generation={} cropped={} reduced={} fixed_scale={} resolved={} suppressed={} mask_drawn={} size={}x{} bytes={} format={} rgba_swizzle={}",
+        sample.frame, sample.pose, sample.generation, sample.cropped, sample.reduced, sample.fixed_view_scale,
+        sample.resolved, sample.suppressed, sample.mask_drawn, desc.Width, desc.Height, bytes, uint32_t(desc.Format), rgba);
+    return true;
+}
+
+bool D3D12Component::OpenXR::SubmissionCapture::finish() {
+    if (readback == nullptr || abandoned) return false;
+    const auto completed = fence->GetCompletedValue();
+    if (completed == UINT64_MAX) {
+        spdlog::error("[Frame Capture] failed reason=device-removed frame={}", sample.frame);
+        *this = {};
+        return true;
+    }
+    if (completed < fence_value) return false;
+    const auto start = std::chrono::steady_clock::now();
+    void* mapped{};
+    D3D12_RANGE range{0, size_t(bytes)};
+    if (FAILED(readback->Map(0, &range, &mapped))) {
+        spdlog::error("[Frame Capture] failed reason=readback-map frame={}", sample.frame);
+        *this = {};
+        return true;
+    }
+    try {
+        const auto directory = Framework::get_persistent_dir("diagnostics");
+        std::filesystem::create_directories(directory);
+        const auto stamp = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        const auto path = directory / ("frame-capture-" + std::to_string(stamp) + "-" + std::to_string(sample.frame) + ".bmp");
+        const auto width = footprint.Footprint.Width;
+        const auto height = footprint.Footprint.Height;
+        BITMAPFILEHEADER file{};
+        BITMAPINFOHEADER info{};
+        static_assert(sizeof(file) == 14 && sizeof(info) == 40);
+        file.bfType = 0x4d42;
+        file.bfOffBits = sizeof(file) + sizeof(info);
+        file.bfSize = file.bfOffBits + width * height * 4;
+        info.biSize = sizeof(info);
+        info.biWidth = LONG(width);
+        info.biHeight = -LONG(height); // Top-down BGRA; no extra full-image CPU copy.
+        info.biPlanes = 1;
+        info.biBitCount = 32;
+        info.biCompression = BI_RGB;
+        info.biSizeImage = width * height * 4;
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        output.exceptions(std::ios::failbit | std::ios::badbit);
+        output.write(reinterpret_cast<const char*>(&file), sizeof(file));
+        output.write(reinterpret_cast<const char*>(&info), sizeof(info));
+        const auto pixels = static_cast<const char*>(mapped) + footprint.Offset;
+        std::vector<char> bgra_row(rgba ? size_t(width) * 4 : 0);
+        for (uint32_t row = 0; row < height; ++row) {
+            const auto source_row = pixels + size_t(row) * footprint.Footprint.RowPitch;
+            if (rgba) {
+                for (size_t x = 0; x < size_t(width) * 4; x += 4) {
+                    bgra_row[x] = source_row[x + 2];
+                    bgra_row[x + 1] = source_row[x + 1];
+                    bgra_row[x + 2] = source_row[x];
+                    bgra_row[x + 3] = source_row[x + 3];
+                }
+            }
+            output.write(rgba ? bgra_row.data() : source_row, size_t(width) * 4);
+        }
+        output.close();
+        spdlog::info("[Frame Capture] complete frame={} pose={} generation={} cropped={} reduced={} fixed_scale={} resolved={} suppressed={} mask_drawn={} size={}x{} write_stall_ms={:.3f} file=\"{}\"",
+            sample.frame, sample.pose, sample.generation, sample.cropped, sample.reduced, sample.fixed_view_scale,
+            sample.resolved, sample.suppressed, sample.mask_drawn, width, height,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), path.string());
+    } catch (const std::exception& error) {
+        spdlog::error("[Frame Capture] failed reason=file-write frame={} error={}", sample.frame, error.what());
+    }
+    D3D12_RANGE written{0, 0};
+    readback->Unmap(0, &written);
+    *this = {};
+    return true;
+}
+
 bool D3D12Component::OpenXR::SubmissionTiming::begin(d3d12::CommandContext& commands) {
     if (unavailable || fence != nullptr || !commands.ready()) {
         return false;
@@ -2184,12 +2344,12 @@ bool D3D12Component::OpenXR::SubmissionTiming::begin(d3d12::CommandContext& comm
         auto queue = hook->get_command_queue();
         D3D12_QUERY_HEAP_DESC query_desc{};
         query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        query_desc.Count = 3;
+        query_desc.Count = query_count;
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_READBACK;
         D3D12_RESOURCE_DESC buffer{};
         buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        buffer.Width = sizeof(uint64_t) * 3;
+        buffer.Width = sizeof(uint64_t) * query_count;
         buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
         buffer.SampleDesc.Count = 1;
         buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -2251,14 +2411,31 @@ void D3D12Component::OpenXR::copy(
     const auto& swapchain = vr->m_openxr->swapchains[swapchain_idx];
     auto& ctx = this->contexts[swapchain_idx];
     const bool double_wide = swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE;
-    const bool timing_enabled = double_wide && vr->m_volumetric_frame_diagnostics->value() && vr->is_native_stereo_fix_enabled();
+    if (double_wide && ctx.capture.finish()) vr->m_volumetric_frame_capture->value() = false;
+    if (double_wide && ctx.capture.abandoned && vr->m_volumetric_frame_capture->value()) {
+        spdlog::error("[Frame Capture] failed reason=previous-submission-failed");
+        vr->m_volumetric_frame_capture->value() = false;
+    }
+    const bool capture_requested = double_wide && vr->m_volumetric_frame_capture->value();
+    // The harness waits for request=false and the complete log before warming up.
+    // Allocation, GPU readback, and synchronous disk writing are outside timing epochs.
+    const bool capture_active = capture_requested || (ctx.capture.readback != nullptr && !ctx.capture.abandoned);
+    const bool timing_enabled = double_wide && vr->m_volumetric_frame_diagnostics->value() && !capture_active;
+    const bool sample_enabled = timing_enabled || capture_requested;
     const bool mask_enabled = vr->is_volumetric_frame_enabled();
-    if (ctx.timing_enabled != timing_enabled || ctx.timing_mask_enabled != mask_enabled) {
-        ctx.gpu_copy = {}; ctx.gpu_mask = {}; ctx.cpu_fence_wait = {}; ctx.cpu_record_execute = {};
-        ctx.timing_pending = ctx.timing_invalid = 0;
+    const uint32_t timing_settings = uint32_t(timing_enabled) | (uint32_t(mask_enabled) << 1) |
+        (uint32_t(vr->is_native_stereo_fix_enabled()) << 2) |
+        (uint32_t(vr->m_volumetric_frame_crop->value()) << 3) |
+        (uint32_t(vr->m_volumetric_frame_reduce_pixels->value()) << 4);
+    const auto fixed_scale = vr->m_volumetric_frame_fixed_view_scale->value();
+    const auto fixed_scale_bits = std::bit_cast<uint32_t>(fixed_scale);
+    if (ctx.timing_settings != timing_settings || ctx.timing_fixed_scale_bits != fixed_scale_bits) {
+        ctx.timing_intervals.clear();
+        ctx.timing_pending = ctx.timing_invalid = ctx.timing_stale = 0;
         ctx.timing_report = std::chrono::steady_clock::now();
-        ctx.timing_enabled = timing_enabled;
-        ctx.timing_mask_enabled = mask_enabled;
+        ctx.timing_settings = timing_settings;
+        ctx.timing_fixed_scale_bits = fixed_scale_bits;
+        ++ctx.timing_epoch;
     }
 
     XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -2295,8 +2472,8 @@ void D3D12Component::OpenXR::copy(
             auto& texture_ctx = ctx.texture_contexts[texture_index];
             const auto fence_wait_start = timing_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             texture_ctx->commands.wait(INFINITE);
+            const auto fence_wait_end = timing_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (timing_enabled) {
-                ctx.cpu_fence_wait.add(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fence_wait_start).count());
                 ctx.timings.resize(ctx.texture_contexts.size());
             }
 
@@ -2360,13 +2537,23 @@ void D3D12Component::OpenXR::copy(
                     timing->fence.Reset();
                     ++ctx.timing_invalid;
                 } else if (completed >= timing->fence_value) {
-                    if (timing_enabled && !timing->unavailable && timing->mask_enabled == mask_enabled) {
+                    if (timing_enabled && !timing->unavailable && timing->epoch == ctx.timing_epoch) {
                         uint64_t* ticks{};
-                        D3D12_RANGE range{0, sizeof(uint64_t) * 3};
+                        D3D12_RANGE range{0, sizeof(uint64_t) * SubmissionTiming::query_count};
                         if (SUCCEEDED(timing->readback->Map(0, &range, reinterpret_cast<void**>(&ticks)))) {
-                            if (ticks[0] <= ticks[1] && ticks[1] <= ticks[2]) {
-                                ctx.gpu_copy.add(double(ticks[1] - ticks[0]) * 1000.0 / timing->frequency);
-                                ctx.gpu_mask.add(double(ticks[2] - ticks[1]) * 1000.0 / timing->frequency);
+                            bool ordered = true;
+                            for (uint32_t i = 1; i < SubmissionTiming::query_count; ++i) ordered &= ticks[i - 1] <= ticks[i];
+                            if (ordered) {
+                                auto& interval = ctx.timing_intervals[timing->sample.key()];
+                                interval.source(timing->sample);
+                                const double ms_per_tick = 1000.0 / timing->frequency;
+                                const auto copy_ticks = ticks[3] - ticks[2];
+                                interval.gpu_pre.add(double(ticks[1] - ticks[0]) * ms_per_tick);
+                                interval.gpu_copy.add(double(copy_ticks) * ms_per_tick);
+                                // Clear and resolve bracket the scratch copy; exclude that copy.
+                                interval.gpu_reconstruct.add(double(ticks[4] - ticks[1] - copy_ticks) * ms_per_tick);
+                                interval.gpu_additional.add(double(ticks[5] - ticks[4]) * ms_per_tick);
+                                interval.gpu_mask.add(double(ticks[6] - ticks[5]) * ms_per_tick);
                             } else {
                                 ++ctx.timing_invalid;
                             }
@@ -2377,6 +2564,8 @@ void D3D12Component::OpenXR::copy(
                             ++ctx.timing_invalid;
                             spdlog::warn("[Frame Timing] D3D12 timestamp readback unavailable for image; CPU diagnostics remain enabled");
                         }
+                    } else if (timing_enabled && timing->epoch != ctx.timing_epoch) {
+                        ++ctx.timing_stale;
                     }
                     timing->fence.Reset();
                 } else if (timing_enabled) {
@@ -2384,16 +2573,23 @@ void D3D12Component::OpenXR::copy(
                 }
             }
             const bool gpu_timing = timing_enabled && timing->begin(texture_ctx->commands);
-            if (gpu_timing) timing->mask_enabled = mask_enabled;
+            SubmissionSample sample{};
+            if (gpu_timing) timing->epoch = ctx.timing_epoch;
             const auto record_start = timing_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
             if (pre_commands) {
                 (*pre_commands)(texture_ctx->commands, ctx.textures[texture_index].texture);
             }
+            if (gpu_timing) texture_ctx->commands.cmd_list->EndQuery(timing->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
 
             const bool resolved = double_wide && component.resolve_volumetric_frame(*texture_ctx,
                 texture_index < ctx.frame_scratch.size() ? ctx.frame_scratch[texture_index].get() : nullptr,
-                resource, src_state, src_box == nullptr && !pre_commands && !additional_commands);
+                resource, src_state, src_box == nullptr && !pre_commands && !additional_commands,
+                gpu_timing ? timing->queries.Get() : nullptr, sample_enabled ? &sample : nullptr);
+
+            // The resolve wrote its copy pair only when it copied into scratch.
+            const bool scratch_copy = double_wide && component.m_frame_submission_resolved;
+            if (gpu_timing && !scratch_copy) texture_ctx->commands.cmd_list->EndQuery(timing->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
 
             // We may simply just want to render to the render target directly
             // hence, a null resource is allowed.
@@ -2418,21 +2614,41 @@ void D3D12Component::OpenXR::copy(
                 }
             }
 
+            if (gpu_timing) {
+                if (!scratch_copy) texture_ctx->commands.cmd_list->EndQuery(timing->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3);
+                texture_ctx->commands.cmd_list->EndQuery(timing->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4);
+            }
             if (additional_commands && !resolved) {
                 (*additional_commands)(texture_ctx->commands);
             }
 
-            if (gpu_timing) texture_ctx->commands.cmd_list->EndQuery(timing->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            if (gpu_timing) texture_ctx->commands.cmd_list->EndQuery(timing->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 5);
             if (swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE) {
-                vr->d3d12().draw_volumetric_frame(*texture_ctx, ctx.textures[texture_index].texture, resource);
+                component.draw_volumetric_frame(*texture_ctx, ctx.textures[texture_index].texture, resource, sample_enabled ? &sample : nullptr);
             }
+            sample.resolved = component.m_frame_submission_resolved;
+            sample.suppressed = component.m_frame_submission_suppressed;
             if (gpu_timing) {
-                texture_ctx->commands.cmd_list->EndQuery(timing->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
-                texture_ctx->commands.cmd_list->ResolveQueryData(timing->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 3, timing->readback.Get(), 0);
+                timing->sample = sample;
+                texture_ctx->commands.cmd_list->EndQuery(timing->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6);
+                texture_ctx->commands.cmd_list->ResolveQueryData(timing->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, SubmissionTiming::query_count, timing->readback.Get(), 0);
                 texture_ctx->commands.has_commands = true;
             }
 
+            bool capture_queued = false;
+            if (capture_requested && ctx.capture.readback == nullptr) {
+                capture_queued = ctx.capture.begin(texture_ctx->commands, ctx.textures[texture_index].texture, sample);
+                if (!capture_queued) vr->m_volumetric_frame_capture->value() = false;
+            }
+
+            const auto execute_start = timing_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             texture_ctx->commands.execute();
+            if (capture_queued && texture_ctx->commands.fence_value != ctx.capture.fence_value) {
+                // Retain the referenced readback until the command context is destroyed.
+                ctx.capture.abandoned = true;
+                vr->m_volumetric_frame_capture->value() = false;
+                spdlog::error("[Frame Capture] failed reason=submission-failed frame={}", sample.frame);
+            }
             if (gpu_timing && texture_ctx->commands.fence_value != timing->fence_value) {
                 // The command list did not submit. Retain resources and stop sampling it.
                 timing->unavailable = true;
@@ -2440,16 +2656,30 @@ void D3D12Component::OpenXR::copy(
             }
             if (timing_enabled) {
                 const auto now = std::chrono::steady_clock::now();
-                ctx.cpu_record_execute.add(std::chrono::duration<double, std::milli>(now - record_start).count());
+                auto& interval = ctx.timing_intervals[sample.key()];
+                // CommandContext::wait also resets its allocator/list; report both costs.
+                interval.cpu_fence_wait.add(std::chrono::duration<double, std::milli>(fence_wait_end - fence_wait_start).count());
+                interval.cpu_record.add(std::chrono::duration<double, std::milli>(execute_start - record_start).count());
+                interval.cpu_execute.add(std::chrono::duration<double, std::milli>(now - execute_start).count());
                 if (now - ctx.timing_report >= std::chrono::seconds(2)) {
                     uint32_t unavailable_images{0};
                     for (const auto& image_timing : ctx.timings) unavailable_images += image_timing.unavailable;
-                    spdlog::info("[Frame Timing] scope=uevr_openxr_native_submission unit_ms=1 mask_enabled={} gpu_n={} gpu_copy_avg={:.4f} gpu_copy_max={:.4f} gpu_mask_avg={:.4f} gpu_mask_max={:.4f} cpu_n={} cpu_image_fence_wait_avg={:.4f} cpu_image_fence_wait_max={:.4f} cpu_record_execute_avg={:.4f} cpu_record_execute_max={:.4f} pending_skips={} invalid={} gpu_unavailable_images={} excludes=unreal_scene_gpu,xr_runtime_pacing",
-                        (uint32_t)mask_enabled, ctx.gpu_copy.count, ctx.gpu_copy.average(), ctx.gpu_copy.maximum, ctx.gpu_mask.average(), ctx.gpu_mask.maximum,
-                        ctx.cpu_record_execute.count, ctx.cpu_fence_wait.average(), ctx.cpu_fence_wait.maximum,
-                        ctx.cpu_record_execute.average(), ctx.cpu_record_execute.maximum, ctx.timing_pending, ctx.timing_invalid, unavailable_images);
-                    ctx.gpu_copy = {}; ctx.gpu_mask = {}; ctx.cpu_fence_wait = {}; ctx.cpu_record_execute = {};
-                    ctx.timing_pending = ctx.timing_invalid = 0;
+                    for (const auto& [key, data] : ctx.timing_intervals) {
+                        spdlog::info("[Frame Timing] scope=uevr_openxr_submission unit_ms=1 epoch={} interval_s={:.3f} native_fix={} mask_enabled={} crop_setting={} reduce_setting={} fixed_scale={} source_fixed_scale={} cropped={} reduced={} lost={} resolved={} suppressed={} mask_drawn={} gpu_n={} frame_first={} frame_last={} pose_first={} pose_last={} probe_first={} probe_last={} generation_first={} generation_last={} gpu_pre_avg={:.4f} gpu_pre_max={:.4f} gpu_source_copy_avg={:.4f} gpu_source_copy_max={:.4f} gpu_reconstruct_avg={:.4f} gpu_reconstruct_max={:.4f} gpu_additional_avg={:.4f} gpu_additional_max={:.4f} gpu_mask_avg={:.4f} gpu_mask_max={:.4f} cpu_n={} cpu_image_wait_reset_avg={:.4f} cpu_image_wait_reset_max={:.4f} cpu_record_avg={:.4f} cpu_record_max={:.4f} cpu_execute_avg={:.4f} cpu_execute_max={:.4f} pending_skips={} invalid={} stale_skips={} gpu_unavailable_images={} excludes=unreal_scene_gpu,xr_runtime_pacing,initial_scratch_setup",
+                            ctx.timing_epoch, std::chrono::duration<double>(now - ctx.timing_report).count(),
+                            (timing_settings >> 2) & 1, uint32_t(mask_enabled), (timing_settings >> 3) & 1, (timing_settings >> 4) & 1,
+                            fixed_scale, std::bit_cast<float>(uint32_t(key >> 32)), key & 3, (key >> 2) & 3,
+                            (key >> 4) & 1, (key >> 5) & 1, (key >> 6) & 1, (key >> 7) & 3,
+                            data.gpu_copy.count, data.first.frame, data.last.frame, data.first.pose, data.last.pose,
+                            data.first.probe, data.last.probe, data.first.generation, data.last.generation,
+                            data.gpu_pre.average(), data.gpu_pre.maximum, data.gpu_copy.average(), data.gpu_copy.maximum,
+                            data.gpu_reconstruct.average(), data.gpu_reconstruct.maximum, data.gpu_additional.average(), data.gpu_additional.maximum,
+                            data.gpu_mask.average(), data.gpu_mask.maximum, data.cpu_record.count,
+                            data.cpu_fence_wait.average(), data.cpu_fence_wait.maximum, data.cpu_record.average(), data.cpu_record.maximum,
+                            data.cpu_execute.average(), data.cpu_execute.maximum, ctx.timing_pending, ctx.timing_invalid, ctx.timing_stale, unavailable_images);
+                    }
+                    ctx.timing_intervals.clear();
+                    ctx.timing_pending = ctx.timing_invalid = ctx.timing_stale = 0;
                     ctx.timing_report = now;
                 }
             }
