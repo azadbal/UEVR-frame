@@ -94,3 +94,30 @@ Compare the volumetric frame with both experimental switches off against both
 on, then repeat off/on after warm-up. First check appearance in Hogwarts. Collect
 CPU/GPU frame times with a verified measurement source before claiming gains;
 these diagnostics currently report geometry, not CPU/GPU execution times.
+
+## Hogwarts follow-up: 2026-09-18
+
+User reports no visual artifacts and no perceived timing improvement: approximately
+14–15 ms in the 72 Hz menu and 20 ms in gameplay. These are user-observed Virtual
+Desktop readings, not timing measurements from our log.
+
+Archived run: `build/diagnostics/prototype06-hogwarts-2026-09-18-191050/`,
+19:06:05.367–19:08:55.653 local. Of 76 sampled submissions, 74 have Native Stereo
+Fix enabled with cropped=0/reduced=0. Only two samples, 19:06:38.954 and
+19:06:40.955, show native_fix=false/cropped=3/reduced=3. Their actual view
+rectangles match the crop dimensions, occupying 35.29% and 37.68% of baseline
+stereo pixel area. By 19:06:42.956 the compatibility fix is enabled again and
+remains enabled in all later samples. No sustained in-game optimized comparison
+is established; the logs do not identify the menu/gameplay boundary explicitly.
+
+At 19:07:46.421 and 19:07:47.424, resolve reports frame 7228 lost=true/mask=0,
+clears the output and latches cropping off until reset. Nearby logs show scene
+capture reset, stalled engine tick and frame numbering restarting. This exposes
+a lifecycle issue worth investigating separately from performance. No speedup
+or performance regression is established by this run.
+
+Before another benchmark, add explicit requested-versus-applied status and
+transition logging, including the blocking reason and failure state. Diagnose
+the lost-frame/reset sequence without weakening protection for in-flight cropped
+images. Then compare sustained off/on intervals with Native Stereo Fix held off
+and all other settings fixed; correlate actual activation with timing evidence.
