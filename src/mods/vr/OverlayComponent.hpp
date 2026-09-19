@@ -46,6 +46,11 @@ public:
         return m_ui_invert_alpha->value();
     }
 
+    float slate_distance() const { return m_slate_distance->value(); }
+    float slate_x_offset() const { return m_slate_x_offset->value(); }
+    float slate_y_offset() const { return m_slate_y_offset->value(); }
+    float slate_size() const { return m_slate_size->value(); }
+
 private:
     // Cached data for imgui VR overlay so we know when we need to update it
     // instead of doing it constantly every frame

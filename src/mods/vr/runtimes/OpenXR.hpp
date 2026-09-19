@@ -309,7 +309,7 @@ public:
     }
 
     PipelineState last_submit_state{};
-    PipelineState get_submit_state();
+    PipelineState get_submit_state(bool consume = true);
     
     const ModSlider::Ptr resolution_scale{ ModSlider::create("OpenXR_ResolutionScale", 0.1f, 3.0f, 1.0f) };
     const ModToggle::Ptr ignore_vd_checks{ ModToggle::create("OpenXR_IgnoreVirtualDesktopChecks", false) };

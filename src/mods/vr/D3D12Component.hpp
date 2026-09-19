@@ -1,6 +1,8 @@
 #pragma once
 
 #include <span>
+#include <atomic>
+#include <glm/glm.hpp>
 
 #include <d3d12.h>
 #include <dxgi.h>
@@ -43,6 +45,7 @@ public:
 
     auto& openxr() { return m_openxr; }
     auto& get_openvr_ui_tex() { return m_openvr.ui_tex; }
+    bool volumetric_frame_failed() const { return m_frame_mask_failed; }
 
 private:
     bool setup();
@@ -54,10 +57,18 @@ private:
 
     void draw_spectator_view(ID3D12GraphicsCommandList* command_list, bool is_right_eye_frame);
     void clear_backbuffer();
+    void draw_volumetric_frame(d3d12::TextureContext& target, ID3D12Resource* resource);
+    bool setup_volumetric_frame(ID3D12Device* device);
 
     template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
 
     ComPtr<ID3D12Resource> m_prev_backbuffer{};
+    ComPtr<ID3D12RootSignature> m_frame_root{};
+    ComPtr<ID3D12PipelineState> m_frame_pipeline{};
+    glm::mat4 m_frame_anchor{1.0f};
+    bool m_frame_was_enabled{false};
+    bool m_frame_was_ui_matched{false};
+    std::atomic<bool> m_frame_mask_failed{false};
     std::array<d3d12::CommandContext, 3> m_generic_commands{};
 
     d3d12::TextureContext m_backbuffer_copy{};

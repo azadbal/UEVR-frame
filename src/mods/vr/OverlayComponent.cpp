@@ -838,33 +838,48 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
 
     auto glm_matrix = glm::identity<glm::mat4>();
 
-    if (vr->m_overlay_component.m_ui_follows_view->value()) {
-        layer.space = vr->m_openxr->view_space;
+    if (vr->is_game_ui_following_frame()) {
+        // The mask path has already built this stage-space pose for the same
+        // submitted frame. It also intentionally flattens a configured
+        // cylinder while the volumetric frame is active.
+        glm_matrix = vr->m_volumetric_frame_layout.pose;
+        layer.space = vr->m_openxr->stage_space;
+        layer.size = {
+            vr->m_volumetric_frame_layout.size.x,
+            vr->m_volumetric_frame_layout.size.y
+        };
     } else {
-        auto rotation_offset = glm::inverse(vr->get_rotation_offset());
+        if (vr->m_overlay_component.m_ui_follows_view->value()) {
+            layer.space = vr->m_openxr->view_space;
+        } else {
+            auto rotation_offset = glm::inverse(vr->get_rotation_offset());
 
-        if (vr->is_decoupled_pitch_enabled() && vr->is_decoupled_pitch_ui_adjust_enabled()) {
-            const auto pre_flat_rotation = vr->get_pre_flattened_rotation();
-            const auto pre_flat_pitch = utility::math::pitch_only(pre_flat_rotation);
+            if (vr->is_decoupled_pitch_enabled() && vr->is_decoupled_pitch_ui_adjust_enabled()) {
+                const auto pre_flat_rotation = vr->get_pre_flattened_rotation();
+                const auto pre_flat_pitch = utility::math::pitch_only(pre_flat_rotation);
 
-            // Add the inverse of the pitch rotation to the rotation offset
-            rotation_offset = glm::normalize(glm::inverse(pre_flat_pitch * vr->get_rotation_offset()));
+                // Add the inverse of the pitch rotation to the rotation offset
+                rotation_offset = glm::normalize(glm::inverse(pre_flat_pitch * vr->get_rotation_offset()));
+            }
+
+            glm_matrix = Matrix4x4f{rotation_offset};
+            glm_matrix[3] += vr->get_standing_origin();
+            layer.space = vr->m_openxr->stage_space;
         }
 
-        glm_matrix = Matrix4x4f{rotation_offset};   
-        glm_matrix[3] += vr->get_standing_origin();
-        layer.space = vr->m_openxr->stage_space;
+        const auto size_meters = m_parent->m_slate_size->value();
+        const auto meters_w = (float)ui_swapchain.width / (float)ui_swapchain.height * size_meters;
+        const auto meters_h = size_meters;
+        layer.size = {meters_w, meters_h};
+
+        glm_matrix[3] -= glm_matrix[2] * m_parent->m_slate_distance->value();
+        glm_matrix[3] += m_parent->m_slate_x_offset->value() * glm_matrix[0];
+        glm_matrix[3] += m_parent->m_slate_y_offset->value() * glm_matrix[1];
+        glm_matrix[3].w = 1.0f;
     }
 
-    const auto size_meters = m_parent->m_slate_size->value();
-    const auto meters_w = (float)ui_swapchain.width / (float)ui_swapchain.height * size_meters;
-    const auto meters_h = size_meters;
-    layer.size = {meters_w, meters_h};
-
-    glm_matrix[3] -= glm_matrix[2] * m_parent->m_slate_distance->value();
-    glm_matrix[3] += m_parent->m_slate_x_offset->value() * glm_matrix[0];
-    glm_matrix[3] += m_parent->m_slate_y_offset->value() * glm_matrix[1];
-    glm_matrix[3].w = 1.0f;
+    const auto meters_w = layer.size.width;
+    const auto meters_h = layer.size.height;
 
     layer.pose.orientation = runtimes::OpenXR::to_openxr(glm::quat_cast(glm_matrix));
     layer.pose.position = runtimes::OpenXR::to_openxr(glm_matrix[3]);
@@ -991,6 +1006,14 @@ std::optional<std::reference_wrapper<XrCompositionLayerBaseHeader>> OverlayCompo
     runtimes::OpenXR::SwapchainIndex swapchain, 
     XrEyeVisibility eye)
 {
+    if (VR::get()->is_game_ui_following_frame()) {
+        if (auto result = generate_slate_quad(swapchain, eye); result.has_value()) {
+            return *(XrCompositionLayerBaseHeader*)&result.value().get();
+        }
+
+        return std::nullopt;
+    }
+
     switch ((OverlayComponent::OverlayType)m_parent->m_slate_overlay_type->value()) {
     default:
     case OverlayComponent::OverlayType::QUAD:

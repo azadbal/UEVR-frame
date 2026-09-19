@@ -1,4 +1,5 @@
 #include <d3dcompiler.h>
+#include <cmath>
 
 #include <openvr.h>
 #include <utility/String.hpp>
@@ -13,6 +14,8 @@
 
 #include "shaders/Compiled/alpha_luminance_sprite_ps_SpritePixelShader.inc"
 #include "shaders/Compiled/alpha_luminance_sprite_ps_SpriteVertexShader.inc"
+#include "shaders/Compiled/volumetric_frame_FrameVS.inc"
+#include "shaders/Compiled/volumetric_frame_FramePS.inc"
 
 #include "d3d12/DirectXTK.hpp"
 
@@ -24,7 +27,198 @@ constexpr auto ENGINE_SRC_DEPTH = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOUR
 constexpr auto ENGINE_SRC_COLOR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
 namespace vrmod {
+bool D3D12Component::setup_volumetric_frame(ID3D12Device* device) {
+    if (m_frame_pipeline != nullptr) {
+        return true;
+    }
+    if (m_frame_mask_failed) {
+        return false;
+    }
+
+    D3D12_ROOT_PARAMETER parameter{};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameter.Constants.Num32BitValues = 32;
+    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC root_desc{};
+    root_desc.NumParameters = 1;
+    root_desc.pParameters = &parameter;
+    ComPtr<ID3DBlob> serialized{}, error{};
+    auto result = D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &error);
+    if (SUCCEEDED(result)) {
+        result = device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&m_frame_root));
+    }
+    if (SUCCEEDED(result)) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+        desc.pRootSignature = m_frame_root.Get();
+        desc.VS = {volumetric_frame_FrameVS, sizeof(volumetric_frame_FrameVS)};
+        desc.PS = {volumetric_frame_FramePS, sizeof(volumetric_frame_FramePS)};
+        desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        desc.SampleMask = UINT_MAX;
+        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        desc.RasterizerState.DepthClipEnable = TRUE;
+        desc.DepthStencilState.DepthEnable = FALSE;
+        desc.DepthStencilState.StencilEnable = FALSE;
+        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc.NumRenderTargets = 1;
+        desc.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        desc.SampleDesc.Count = 1;
+        result = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&m_frame_pipeline));
+    }
+    if (FAILED(result)) {
+        spdlog::error("[Volumetric Frame] Failed to create D3D12 mask pipeline: {:x}", (uint32_t)result);
+        m_frame_mask_failed = true;
+        return false;
+    }
+    spdlog::info("[Volumetric Frame] D3D12 mask pipeline ready");
+    return true;
+}
+
+void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12Resource* resource) {
+    auto& vr = VR::get();
+    // The layer builder runs later in this same frame. Never leave it with a
+    // pose from a previous frame when the mask cannot be produced.
+    vr->m_volumetric_frame_layout.active = false;
+    if (!vr->is_volumetric_frame_enabled()) {
+        m_frame_was_enabled = false;
+        m_frame_was_ui_matched = false;
+        return;
+    }
+
+    // Peek without consuming the render-frame association needed by xrEndFrame.
+    const auto state = vr->m_openxr->get_submit_state(false);
+    if (state.stage_views.size() != 2) {
+        return;
+    }
+    const auto desc = resource->GetDesc();
+    auto device = g_framework->get_d3d12_hook()->get_device();
+    if (desc.SampleDesc.Count != 1) {
+        if (!m_frame_mask_failed) {
+            spdlog::error("[Volumetric Frame] Multisampled swapchains are unsupported");
+        }
+        m_frame_mask_failed = true;
+        return;
+    }
+    if (!setup_volumetric_frame(device)) {
+        return;
+    }
+    if (target.rtv_heap == nullptr) {
+        target.texture = resource;
+        if (!target.create_rtv(device, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) {
+            m_frame_mask_failed = true;
+            return;
+        }
+    }
+
+    auto pose_matrix = [](const XrPosef& pose) {
+        auto matrix = glm::mat4_cast(glm::quat{pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z});
+        matrix[3] = glm::vec4{pose.position.x, pose.position.y, pose.position.z, 1.0f};
+        return matrix;
+    };
+    const std::array<glm::mat4, 2> eyes{pose_matrix(state.stage_views[0].pose), pose_matrix(state.stage_views[1].pose)};
+    const bool recenter = vr->m_volumetric_frame_recenter.exchange(false);
+
+    const auto make_slate_anchor = [&]() {
+        auto rotation_offset = glm::inverse(vr->get_rotation_offset());
+
+        if (vr->is_decoupled_pitch_enabled() && vr->is_decoupled_pitch_ui_adjust_enabled()) {
+            const auto pre_flat_rotation = vr->get_pre_flattened_rotation();
+            const auto pre_flat_pitch = utility::math::pitch_only(pre_flat_rotation);
+            rotation_offset = glm::normalize(glm::inverse(pre_flat_pitch * vr->get_rotation_offset()));
+        }
+
+        auto anchor = Matrix4x4f{rotation_offset};
+        anchor[3] += vr->get_standing_origin();
+        return anchor;
+    };
+
+    const bool match_ui = vr->m_volumetric_frame_match_ui->value();
+    const bool rematch = match_ui != m_frame_was_ui_matched;
+    const bool initial_activation = !m_frame_was_enabled;
+    const auto anchor_source = volumetric_frame_anchor_source(match_ui, initial_activation, rematch, recenter);
+    if (anchor_source != VolumetricFrameAnchorSource::KEEP) {
+        if (anchor_source == VolumetricFrameAnchorSource::UI) {
+            // Always use the normal stage-anchored UI placement, even if its
+            // saved presentation preference follows the head.
+            m_frame_anchor = make_slate_anchor();
+        } else {
+            // Explicit recenter and initial manual placement use the head.
+            const auto forward = -glm::vec3{eyes[0][2] + eyes[1][2]};
+            const auto yaw = std::atan2(-forward.x, -forward.z);
+            m_frame_anchor = glm::mat4_cast(glm::angleAxis(yaw, glm::vec3{0, 1, 0}));
+            m_frame_anchor[3] = (eyes[0][3] + eyes[1][3]) * 0.5f;
+        }
+        spdlog::info("[Volumetric Frame] Recentered window");
+    }
+    m_frame_was_enabled = true;
+    m_frame_was_ui_matched = match_ui;
+    const auto frame_size = match_ui
+        ? volumetric_frame_size(vr->get_overlay_component().slate_size())
+        : glm::vec2{vr->m_volumetric_frame_width->value(), vr->m_volumetric_frame_width->value() * 9.0f / 16.0f};
+    const auto frame_pose = match_ui
+        ? apply_volumetric_frame_offsets(
+            m_frame_anchor,
+            vr->get_overlay_component().slate_distance(),
+            vr->get_overlay_component().slate_x_offset(),
+            vr->get_overlay_component().slate_y_offset())
+        : apply_volumetric_frame_offsets(
+            m_frame_anchor,
+            vr->m_volumetric_frame_distance->value(),
+            0.0f,
+            0.0f);
+
+    vr->m_volumetric_frame_layout.pose = frame_pose;
+    vr->m_volumetric_frame_layout.size = frame_size;
+    vr->m_volumetric_frame_layout.active = true;
+
+    const auto stage_to_frame = glm::inverse(frame_pose);
+
+    auto list = target.commands.cmd_list.Get();
+    const auto rtv = target.get_rtv();
+    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    list->SetGraphicsRootSignature(m_frame_root.Get());
+    list->SetPipelineState(m_frame_pipeline.Get());
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    for (uint32_t i = 0; i < 2; ++i) {
+        const auto eye_to_frame = stage_to_frame * eyes[i];
+        const auto& fov = state.stage_views[i].fov;
+        const auto& bounds = vr->m_openxr->view_bounds[i];
+        const int eye_width = (int)desc.Width / 2;
+        // Match the integer sub-image rectangle in OpenXR::end_frame exactly.
+        const int x = i * eye_width + (int)(bounds[0] * eye_width);
+        const int y = (int)(bounds[2] * desc.Height);
+        const int width = (int)(bounds[1] * eye_width) - (x - i * eye_width);
+        const int height = (int)(bounds[3] * desc.Height) - y;
+        if (width <= 0 || height <= 0) {
+            continue;
+        }
+        const float half_width = frame_size.x * 0.5f;
+        const std::array<glm::vec4, 8> constants{
+            eye_to_frame[0], eye_to_frame[1], eye_to_frame[2], eye_to_frame[3],
+            glm::vec4{std::tan(fov.angleLeft), std::tan(fov.angleRight), std::tan(fov.angleUp), std::tan(fov.angleDown)},
+            glm::vec4{(float)x, (float)y, (float)width, (float)height},
+            glm::vec4{half_width, frame_size.y * 0.5f, 0, 0},
+            glm::vec4{0, vr->m_volumetric_frame_green->value() ? 1.0f : 0.0f, 0, 1}
+        };
+        static_assert(sizeof(constants) == 32 * sizeof(float));
+        const D3D12_VIEWPORT viewport{(float)x, (float)y, (float)width, (float)height, 0, 1};
+        const D3D12_RECT scissor{x, y, x + width, y + height};
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        list->SetGraphicsRoot32BitConstants(0, 32, constants.data(), 0);
+        list->DrawInstanced(3, 1, 0, 0);
+    }
+    target.commands.has_commands = true;
+}
+
 vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
+    if (!vr->is_volumetric_frame_enabled()) {
+        m_frame_was_enabled = false;
+        m_frame_was_ui_matched = false;
+        vr->m_volumetric_frame_layout.active = false;
+    }
+
     if (m_force_reset || m_last_afr_state != vr->is_using_afr()) {
         if (!setup()) {
             SPDLOG_ERROR_EVERY_N_SEC(1, "[D3D12 VR] Could not set up, trying again next frame");
@@ -412,7 +606,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
     ComPtr<ID3D12Resource> scene_depth_tex{};
 
-    if (vr->is_depth_enabled() && runtime->is_depth_allowed()) {
+    if (vr->is_depth_enabled() && runtime->is_depth_allowed() && !vr->is_volumetric_frame_enabled()) {
         auto& rt_pool = vr->get_render_target_pool_hook();
         scene_depth_tex = rt_pool->get_texture<ID3D12Resource>(L"SceneDepthZ");
 
@@ -1036,6 +1230,7 @@ void D3D12Component::on_post_present(VR* vr) {
 
 void D3D12Component::on_reset(VR* vr) {
     m_force_reset = true;
+    vr->m_volumetric_frame_layout.active = false;
 
     auto runtime = vr->get_runtime();
 
@@ -1107,6 +1302,11 @@ void D3D12Component::on_reset(VR* vr) {
         //vr->m_openxr.end_frame();
     }
 
+    m_frame_pipeline.Reset();
+    m_frame_root.Reset();
+    m_frame_mask_failed = false;
+    m_frame_was_enabled = false;
+    m_frame_was_ui_matched = false;
     m_prev_backbuffer.Reset();
     m_openvr.texture_counter = 0;
 }
@@ -1779,6 +1979,10 @@ void D3D12Component::OpenXR::copy(
 
             if (additional_commands) {
                 (*additional_commands)(texture_ctx->commands);
+            }
+
+            if (swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE) {
+                vr->d3d12().draw_volumetric_frame(*texture_ctx, ctx.textures[texture_index].texture);
             }
 
             texture_ctx->commands.execute();

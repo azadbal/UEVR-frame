@@ -1965,6 +1965,7 @@ void VR::handle_keybinds() {
 void VR::on_frame() {
     ZoneScopedN(__FUNCTION__);
 
+    m_volumetric_frame_layout.active = false;
     m_cvar_manager->on_frame();
     handle_keybinds();
 
@@ -2249,6 +2250,12 @@ void VR::on_post_present() {
     }
 }
 
+bool VR::is_volumetric_frame_supported() const {
+    return g_framework->is_dx12() && get_runtime()->is_openxr() &&
+        !is_using_afr() && !is_using_2d_screen() && !is_extreme_compatibility_mode_enabled() &&
+        !is_stereo_emulation_enabled();
+}
+
 uint32_t VR::get_hmd_width() const {
     if (m_2d_screen_mode->value()) {
         if (get_runtime()->is_openxr()) {
@@ -2395,6 +2402,34 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         m_desktop_fix->draw("Desktop Spectator View");
         ImGui::SameLine();
         m_2d_screen_mode->draw("2D Screen Mode");
+
+        if (ImGui::TreeNode("Volumetric Frame (Experimental)")) {
+            const auto was_enabled = m_volumetric_frame->value();
+            m_volumetric_frame->draw("Enable Volumetric Frame");
+            if (was_enabled != m_volumetric_frame->value()) {
+                m_volumetric_frame_recenter = true;
+            }
+            ImGui::TextWrapped("16:9 window anchored in your play space. Requires D3D12, OpenXR and Native Stereo; turn off 2D Screen Mode and Extreme Compatibility Mode.");
+            if (m_volumetric_frame->value() && !is_volumetric_frame_supported()) {
+                ImGui::TextWrapped("Frame inactive: the current rendering settings are unsupported.");
+            }
+            if (m_d3d12.volumetric_frame_failed()) {
+                ImGui::TextWrapped("Frame mask failed to initialize. See the UEVR log for details.");
+            }
+            m_volumetric_frame_match_ui->draw("Match Game UI (automatic)");
+            m_volumetric_frame_move_ui->draw("Move Game UI with Frame");
+            ImGui::TextWrapped("Matching restores the normal anchored UI position. Recenter Frame places the window in front of you. Turn off Move Game UI with Frame to leave the HUD in its normal position.");
+            if (!m_volumetric_frame_match_ui->value()) {
+                m_volumetric_frame_width->draw("Frame Width (meters)");
+                m_volumetric_frame_distance->draw("Frame Distance (meters)");
+            }
+            m_volumetric_frame_green->draw("Green Surroundings (0, 255, 0)");
+            if (ImGui::Button("Recenter Frame")) {
+                m_volumetric_frame_recenter = true;
+            }
+            ImGui::TextWrapped("Black surroundings when green is off. Depth submission is disabled while the frame is active. Matching uses a fixed 16:9 portal rectangle.");
+            ImGui::TreePop();
+        }
 
         ImGui::TextWrapped("Render Resolution (per-eye): %d x %d", get_runtime()->get_width(), get_runtime()->get_height());
         ImGui::TextWrapped("Total Render Resolution: %d x %d", get_runtime()->get_width() * 2, get_runtime()->get_height());
@@ -3243,6 +3278,7 @@ void VR::recenter_view() {
     const auto new_rotation_offset = glm::normalize(glm::inverse(utility::math::flatten(glm::quat{get_rotation(0)})));
 
     set_rotation_offset(new_rotation_offset);
+    m_volumetric_frame_recenter = true;
 }
 
 void VR::recenter_horizon() {
@@ -3251,6 +3287,7 @@ void VR::recenter_horizon() {
     const auto new_rotation_offset = glm::normalize(glm::inverse(glm::quat{get_rotation(0)}));
 
     set_rotation_offset(new_rotation_offset);
+    m_volumetric_frame_recenter = true;
 }
 
 void VR::gamepad_snapturn(XINPUT_STATE& state) {

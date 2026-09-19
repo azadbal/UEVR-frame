@@ -13,6 +13,7 @@
 #include "vr/D3D11Component.hpp"
 #include "vr/D3D12Component.hpp"
 #include "vr/OverlayComponent.hpp"
+#include "vr/VolumetricFrameLayout.hpp"
 
 #include "vr/FFakeStereoRenderingHook.hpp"
 #include "vr/RenderTargetPoolHook.hpp"
@@ -576,6 +577,21 @@ public:
         return m_2d_screen_mode->value();
     }
 
+    bool is_volumetric_frame_supported() const;
+    bool is_volumetric_frame_enabled() const {
+        return m_volumetric_frame->value() && is_volumetric_frame_supported();
+    }
+
+    bool is_game_ui_following_frame() const {
+        return is_volumetric_frame_enabled() && m_volumetric_frame_move_ui->value() && m_volumetric_frame_layout.active;
+    }
+
+    std::atomic<bool> m_volumetric_frame_recenter{true};
+
+    // This is deliberately transient: it is rebuilt by the D3D12 mask path and
+    // consumed by the OpenXR Slate layer in the same submitted frame.
+    vrmod::VolumetricFrameLayout m_volumetric_frame_layout{};
+
     bool is_roomscale_enabled() const {
         return m_roomscale_movement->value() && !m_aim_temp_disabled;
     }
@@ -895,6 +911,12 @@ private:
     const ModToggle::Ptr m_decoupled_pitch_ui_adjust{ ModToggle::create(generate_name("DecoupledPitchUIAdjust"), true) };
     const ModToggle::Ptr m_load_blueprint_code{ ModToggle::create(generate_name("LoadBlueprintCode"), false, true) };
     const ModToggle::Ptr m_2d_screen_mode{ ModToggle::create(generate_name("2DScreenMode"), false) };
+    const ModToggle::Ptr m_volumetric_frame{ ModToggle::create(generate_name("VolumetricFrame"), false) };
+    const ModSlider::Ptr m_volumetric_frame_width{ ModSlider::create(generate_name("VolumetricFrameWidth"), 0.5f, 6.0f, 2.0f) };
+    const ModSlider::Ptr m_volumetric_frame_distance{ ModSlider::create(generate_name("VolumetricFrameDistance"), 0.25f, 6.0f, 2.0f) };
+    const ModToggle::Ptr m_volumetric_frame_match_ui{ ModToggle::create(generate_name("VolumetricFrameMatchUI"), true) };
+    const ModToggle::Ptr m_volumetric_frame_move_ui{ ModToggle::create(generate_name("VolumetricFrameMoveUI"), true) };
+    const ModToggle::Ptr m_volumetric_frame_green{ ModToggle::create(generate_name("VolumetricFrameGreen"), false) };
     const ModToggle::Ptr m_roomscale_movement{ ModToggle::create(generate_name("RoomscaleMovement"), false) };
     const ModToggle::Ptr m_roomscale_sweep{ ModToggle::create(generate_name("RoomscaleMovementSweep"), true) };
     const ModToggle::Ptr m_swap_controllers{ ModToggle::create(generate_name("SwapControllerInputs"), false) };
@@ -1041,6 +1063,12 @@ public:
             *m_decoupled_pitch_ui_adjust,
             *m_load_blueprint_code,
             *m_2d_screen_mode,
+            *m_volumetric_frame,
+            *m_volumetric_frame_width,
+            *m_volumetric_frame_distance,
+            *m_volumetric_frame_match_ui,
+            *m_volumetric_frame_move_ui,
+            *m_volumetric_frame_green,
             *m_roomscale_movement,
             *m_roomscale_sweep,
             *m_swap_controllers,
