@@ -65,3 +65,32 @@ manifest. Headset behavior and measured performance remain pending.
 
 Resize and virtual viewing distance remain deferred in AZA-201. Performance work
 continues in AZA-198.
+
+## First FluidFlux run: 2026-09-18
+
+User completed the test and confirmed Reduce Scene Pixels looked the same,
+including the requested sharpness/HUD/reflections/head-movement comparison.
+This accepts appearance for this run; performance remains unmeasured.
+
+- Log span: 18:53:42.584–18:54:30.423 local. Archived full log, filtered records
+  and summary at `build/diagnostics/prototype06-2026-09-18-185518/`.
+- 24 rate-limited submission samples: 8 baseline, 2 projection crop only,
+  14 both-eye cropped and reduced. All 23 non-startup samples have matched
+  frame/pose association, both projections and both view rectangles recorded.
+- Reduced sampling begins at 18:54:04.326. All 28 reduced eye rectangles match
+  their crop dimensions and retain the correct full-allocation packing offset.
+  Combined active area: min 35.67%, median 39.23%, max 52.01% of baseline.
+  The median is about 61% fewer requested active scene pixels, not a 61% speedup.
+- Scene/output allocations remain 5376x2880 as intended (2688x2880 per eye).
+  No logged errors after reduction begins and no crop resolve failure. Startup
+  hook/initialization retries and a pre-crop DInput timeout are present.
+- Samples show baseline → crop only → crop plus reduction. They do not establish
+  off/on reversal, recenter or background-color coverage; those actions are not
+  separately recorded here. Logs are sampled, not exhaustive per-frame evidence.
+
+Next: heavier-game compatibility and controlled timing comparison in Hogwarts,
+keeping frame placement, scene/camera, quality, upscaler and resolution fixed.
+Compare the volumetric frame with both experimental switches off against both
+on, then repeat off/on after warm-up. First check appearance in Hogwarts. Collect
+CPU/GPU frame times with a verified measurement source before claiming gains;
+these diagnostics currently report geometry, not CPU/GPU execution times.
