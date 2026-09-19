@@ -587,6 +587,9 @@ public:
         return m_volumetric_frame->value() && is_volumetric_frame_supported();
     }
     bool is_volumetric_frame_green() const { return m_volumetric_frame_green->value(); }
+    bool is_frame_pixel_reduction_requested() const {
+        return is_frame_crop_requested() && m_volumetric_frame_reduce_pixels->value();
+    }
 
     bool is_game_ui_following_frame() const {
         return is_volumetric_frame_enabled() && m_volumetric_frame_move_ui->value() && m_volumetric_frame_layout.active;
@@ -925,6 +928,7 @@ private:
     const ModToggle::Ptr m_volumetric_frame_green{ ModToggle::create(generate_name("VolumetricFrameGreen"), false) };
     const ModToggle::Ptr m_volumetric_frame_diagnostics{ ModToggle::create(generate_name("VolumetricFrameDiagnostics"), false) };
     const ModToggle::Ptr m_volumetric_frame_crop{ ModToggle::create(generate_name("VolumetricFrameCrop"), false) };
+    const ModToggle::Ptr m_volumetric_frame_reduce_pixels{ ModToggle::create(generate_name("VolumetricFrameReducePixels"), false) };
     const ModToggle::Ptr m_roomscale_movement{ ModToggle::create(generate_name("RoomscaleMovement"), false) };
     const ModToggle::Ptr m_roomscale_sweep{ ModToggle::create(generate_name("RoomscaleMovementSweep"), true) };
     const ModToggle::Ptr m_swap_controllers{ ModToggle::create(generate_name("SwapControllerInputs"), false) };
@@ -1079,6 +1083,7 @@ public:
             *m_volumetric_frame_green,
             *m_volumetric_frame_diagnostics,
             *m_volumetric_frame_crop,
+            *m_volumetric_frame_reduce_pixels,
             *m_roomscale_movement,
             *m_roomscale_sweep,
             *m_swap_controllers,

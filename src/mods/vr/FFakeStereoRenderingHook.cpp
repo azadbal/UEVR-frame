@@ -4704,6 +4704,20 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
         index_starts_from_one = false;
     }
 
+    const auto true_index = index_starts_from_one ? ((index + 1) % 2) : (index % 2);
+    auto record_frame_rect = [&](bool allow_reduction) {
+        const auto& vr = VR::get();
+        if (vr->get_runtime()->is_openxr() && ((vr->is_volumetric_frame_enabled() &&
+            (vr->m_volumetric_frame_diagnostics->value() || vr->m_volumetric_frame_crop->value())) ||
+            vr->m_openxr->frame_crop_ever_applied.load())) {
+            const auto rect = vr->m_openxr->record_frame_view_rect(true_index, *x, *y, (int)*w, (int)*h, allow_reduction);
+            *x = rect.x;
+            *y = rect.y;
+            *w = rect.width;
+            *h = rect.height;
+        }
+    };
+
     // The purpose of this is to prevent the game from crashing in IDirect3D12CommandList::Close
     // Because the game will try to copy a texture region that is out of bounds.
     if (g_hook->m_skip_next_adjust_view_rect) {
@@ -4713,6 +4727,7 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
         *h = std::min<uint32_t>(VR::get()->get_hmd_height(), *h);
         g_hook->m_skip_next_adjust_view_rect = false;
         g_hook->m_skip_next_adjust_view_rect_count = 1;
+        record_frame_rect(false);
         return;
     }
 
@@ -4722,6 +4737,7 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
         *w = std::min<uint32_t>(VR::get()->get_hmd_width(), *w);
         *h = std::min<uint32_t>(VR::get()->get_hmd_height(), *h);
         --g_hook->m_skip_next_adjust_view_rect_count;
+        record_frame_rect(false);
         return;
     }
 
@@ -4735,16 +4751,10 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
 
     *w = *w / 2;
 
-    const auto true_index = index_starts_from_one ? ((index + 1) % 2) : (index % 2);
-
     if (!VR::get()->is_native_stereo_fix_enabled()) {
         *x += *w * true_index;
     }
-    if (VR::get()->get_runtime()->is_openxr() && ((VR::get()->is_volumetric_frame_enabled() &&
-        (VR::get()->m_volumetric_frame_diagnostics->value() || VR::get()->m_volumetric_frame_crop->value())) ||
-        VR::get()->m_openxr->frame_crop_ever_applied.load())) {
-        VR::get()->m_openxr->record_frame_view_rect(true_index, *x, *y, (int)*w, (int)*h);
-    }
+    record_frame_rect(true);
 }
 
 __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
@@ -5195,8 +5205,7 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         if (vr->get_runtime()->is_openxr() && ((vr->is_volumetric_frame_enabled() &&
             (vr->m_volumetric_frame_diagnostics->value() || vr->m_volumetric_frame_crop->value())) ||
             vr->m_openxr->frame_crop_ever_applied.load())) {
-            const glm::mat4 baseline = g_hook->m_has_double_precision ? glm::mat4{double_matrix} : *out;
-            vr->m_openxr->record_frame_projection(true_index, baseline);
+            vr->m_openxr->prepare_frame_probe();
             if (const auto crop = vr->m_openxr->apply_frame_crop(true_index)) {
                 // Preserve the engine matrix's depth rows and precision. Runtime
                 // FOV/poses stay full-size; the submitted color is resolved back.
@@ -5206,6 +5215,8 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
                     *out = vrmod::crop_volumetric_frame_projection(*out, crop->rect, crop->width, crop->height);
                 }
             }
+            const glm::mat4 actual = g_hook->m_has_double_precision ? glm::mat4{double_matrix} : *out;
+            vr->m_openxr->record_frame_projection(true_index, actual);
         }
     } else {
         SPDLOG_ERROR("CalculateStereoProjectionMatrix returned nullptr!");

@@ -2430,7 +2430,9 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             ImGui::TextWrapped("Black surroundings when green is off. Depth submission is disabled while the frame is active. Matching uses a fixed 16:9 portal rectangle.");
             m_volumetric_frame_crop->draw("Experimental Projection Crop");
             if (m_volumetric_frame_crop->value()) {
-                ImGui::TextWrapped("Narrows the game views through the frame. Scene resolution stays unchanged for this test. Turn off Native Stereo Fix, SceneView and SplitScreen compatibility. Disable this option if the image looks wrong.");
+                ImGui::TextWrapped("Narrows the game views through the frame. Turn off Native Stereo Fix, SceneView and SplitScreen compatibility. Disable this option if the image looks wrong.");
+                m_volumetric_frame_reduce_pixels->draw("Reduce Scene Pixels (Experimental)");
+                ImGui::TextWrapped("Renders only the crop's pixel dimensions inside the existing textures. Headset output resolution stays unchanged. Off keeps the previous full-resolution crop test.");
             }
             m_volumetric_frame_diagnostics->draw("Performance Diagnostics");
             if (m_volumetric_frame_diagnostics->value()) {

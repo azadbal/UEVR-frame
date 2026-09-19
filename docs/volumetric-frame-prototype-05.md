@@ -54,8 +54,10 @@ from this run.
 - New D3D12 WARP resolve: all seven cases pass, no debug-layer errors. Identity
   and background are byte-exact; filtered crop interiors match a CPU sRGB
   bilinear reference within three channel byte values (GPU filter precision).
-- FluidFlux runtime appearance, actual culling savings and performance:
-  **PENDING**. Synthetic shader tests do not verify game rendering behavior.
+- FluidFlux runtime appearance: **ACCEPTED** on 2026-09-18; the user reported
+  cropping was imperceptible. The archived run includes 11 sampled both-eye crop
+  submissions with matching frame association and no crop resolve errors.
+  Actual culling savings and performance remain **UNMEASURED**.
 - Resize and virtual viewing distance remain deferred.
 
 ## Implementation and diagnostic evidence

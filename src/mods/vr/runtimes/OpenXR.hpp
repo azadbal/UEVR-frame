@@ -219,6 +219,7 @@ public:
         uint32_t prev_frame_count{0}; // Updated right after xrWaitFrame is called
         uint32_t pose_frame_count{0};
         bool stage_pose_valid{false};
+        uint64_t pose_generation{0};
         bool frame_crop_lost{false};
         vrmod::VolumetricFrameProbe frame_probe{};
     };
@@ -316,8 +317,10 @@ public:
 
     PipelineState last_submit_state{};
     PipelineState get_submit_state(bool consume = true);
+    void prepare_frame_probe();
     void record_frame_projection(uint32_t eye, const glm::mat4& projection);
-    void record_frame_view_rect(uint32_t eye, int x, int y, int width, int height);
+    vrmod::VolumetricFramePixelRect record_frame_view_rect(uint32_t eye, int x, int y, int width, int height,
+        bool allow_reduction = true);
     struct FrameCrop { vrmod::VolumetricFramePixelRect rect; int width, height; };
     std::optional<FrameCrop> apply_frame_crop(uint32_t eye);
     std::atomic<bool> frame_crop_ever_applied{false};

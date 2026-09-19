@@ -62,6 +62,91 @@ void projection_test() {
         "Invalid crop must preserve baseline projection");
 }
 
+void view_transition_test() {
+    const int width = 2053, height = 1999;
+    const std::array<VolumetricFramePixelRect, 2> full{{{0, 0, width, height}, {width, 0, width, height}}};
+    auto ready = [&]() {
+        VolumetricFrameProbe probe{};
+        probe.pose_frame = 42;
+        probe.prepared = probe.layout.active = probe.crop_requested = true;
+        probe.width = width;
+        probe.height = height;
+        probe.crops = {{{{101, 201, 901, 801}, VolumetricFrameCropFallback::NONE},
+                        {{82, 212, 887, 793}, VolumetricFrameCropFallback::NONE}}};
+        return probe;
+    };
+    bool lost = false;
+    auto phase2 = ready();
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        require(equal(phase2.record_view_rect(eye, full[eye], lost), full[eye]), "Phase 2 changed active dimensions");
+        require(phase2.apply_projection_crop(eye, lost), "Phase 2 did not retain crop projection");
+    }
+    require(!lost && phase2.cropped_mask == 3 && phase2.reduced_mask == 0, "Phase 2 state changed");
+
+    auto phase3 = ready();
+    phase3.reduce_pixels_requested = true;
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        const auto actual = phase3.record_view_rect(eye, full[eye], lost);
+        require(equal(actual, {(int)eye * width, 0, phase3.crops[eye].rect.width, phase3.crops[eye].rect.height}),
+            "Reduced view lost integer crop extent or stable full-allocation packing");
+        require(phase3.can_crop(eye) && phase3.apply_projection_crop(eye, lost), "Reduced view lost matching crop projection");
+        require(equal(phase3.record_view_rect(eye, full[eye], lost), actual), "Repeated view callback changed frozen dimensions");
+    }
+    require(!lost && phase3.reduced_mask == 3 && phase3.cropped_mask == 3, "Phase 3 did not record both actual reductions");
+    require(phase3.width == width && phase3.height == height, "Reduction changed output dimensions");
+    require(phase3.has_modified_view(), "Modified frame cannot be detected on pose replacement");
+    phase3.reduce_pixels_requested = false;
+    require(equal(phase3.record_view_rect(1, full[1], lost), {width, 0, 887, 793}) &&
+        phase3.apply_projection_crop(1, lost), "Reduction toggle changed an already returned view");
+
+    auto fallback = ready();
+    fallback.reduce_pixels_requested = true;
+    fallback.crops[1].fallback = VolumetricFrameCropFallback::EYE_PLANE;
+    fallback.record_view_rect(0, full[0], lost);
+    require(equal(fallback.record_view_rect(1, full[1], lost), full[1]), "Fallback eye was reduced");
+    require(fallback.apply_projection_crop(0, lost) && !fallback.apply_projection_crop(1, lost) &&
+        fallback.reduced_mask == 1 && !lost, "Per-eye fallback changed valid eye or blanked frame");
+
+    auto packing = ready();
+    packing.reduce_pixels_requested = true;
+    const VolumetricFramePixelRect unexpected{0, 0, width, height};
+    require(equal(packing.record_view_rect(1, unexpected, lost), unexpected) &&
+        !packing.apply_projection_crop(1, lost) && packing.reduced_mask == 0, "Unsupported packing reduced or cropped");
+
+    auto order = ready();
+    order.reduce_pixels_requested = true;
+    require(!order.apply_projection_crop(0, lost), "Projection before view cropped");
+    require(equal(order.record_view_rect(0, full[0], lost), full[0]) && !order.apply_projection_crop(0, lost),
+        "Late view changed an already returned full projection decision");
+
+    auto late_pose = ready();
+    late_pose.prepared = false;
+    late_pose.reduce_pixels_blocked = true;
+    late_pose.record_view_rect(0, full[0], lost);
+    late_pose.prepared = late_pose.reduce_pixels_requested = true;
+    require(equal(late_pose.record_view_rect(1, full[1], lost), full[1]) && late_pose.apply_projection_crop(0, lost) &&
+        late_pose.apply_projection_crop(1, lost) && late_pose.reduced_mask == 0, "Late pose failed full-size Phase 2 fallback");
+
+    auto incomplete = ready();
+    incomplete.reduce_pixels_requested = true;
+    incomplete.record_view_rect(0, full[0], lost);
+    require(incomplete.has_modified_view() && (incomplete.reduced_mask & ~incomplete.cropped_mask) == 1,
+        "Reduced view without a matching projection cannot be detected at submission");
+    incomplete.crops[0].rect.width = 0;
+    require(!incomplete.apply_projection_crop(0, lost) && lost, "Lost crop after shrinking did not fail closed");
+
+    lost = false;
+    phase3.record_view_rect(1, unexpected, lost);
+    require(lost, "Incompatible view overwrite after reducing did not fail closed");
+    lost = false;
+    auto invalid = ready();
+    invalid.reduce_pixels_requested = true;
+    invalid.crops[0].rect = {width - 1, 0, 2, 1};
+    require(equal(invalid.record_view_rect(0, full[0], lost), full[0]) && !invalid.apply_projection_crop(0, lost),
+        "Out-of-bounds crop was accepted");
+    require(!lost && invalid.reduced_mask == 0, "Invalid candidate modified the baseline frame");
+}
+
 int main() try {
     const int width = 2053, height = 1999;
     const VolumetricFramePixelRect submitted{103, 81, 1843, 1796};
@@ -152,7 +237,8 @@ int main() try {
     require(!probe.matches(100, width, height) && !probe.can_crop(0), "Invalidated snapshot accepted");
     projection_test<float>();
     projection_test<double>();
-    std::puts("PASS: crop containment, asymmetric FOV/subimages, guard/fallback, float/double projection and pixel-center resolve");
+    view_transition_test();
+    std::puts("PASS: crop containment, projection/pixel mapping, phase 2/3 view decisions, packing, callback order and fail-closed transitions");
     return 0;
 } catch (const std::exception& e) {
     std::printf("FAIL: %s\n", e.what());

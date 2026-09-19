@@ -92,7 +92,7 @@ bool D3D12Component::resolve_volumetric_frame(d3d12::TextureContext& target, d3d
     auto& vr = VR::get();
     const auto state = vr->m_openxr->get_submit_state(false);
     const auto& probe = state.frame_probe;
-    if (probe.cropped_mask == 0 && !state.frame_crop_lost) {
+    if (probe.cropped_mask == 0 && probe.reduced_mask == 0 && !state.frame_crop_lost) {
         return false;
     }
 
@@ -101,7 +101,9 @@ bool D3D12Component::resolve_volumetric_frame(d3d12::TextureContext& target, d3d
     // cropped rays over a full-FOV image.
     const auto desc = target.texture->GetDesc();
     const auto source_desc = source != nullptr ? source->GetDesc() : D3D12_RESOURCE_DESC{};
-    bool valid = !state.frame_crop_lost && probe.matches(state.frame_count, (int)desc.Width / 2, (int)desc.Height) &&
+    bool valid = !state.frame_crop_lost && (probe.reduced_mask & ~probe.cropped_mask) == 0 &&
+        probe.rect_mask == 3 && probe.projection_mask == 3 &&
+        probe.matches(state.frame_count, (int)desc.Width / 2, (int)desc.Height) &&
         state.stage_views.size() == 2 && scratch != nullptr && scratch->texture != nullptr && scratch->srv_heap != nullptr &&
         m_frame_resolve_pipeline != nullptr && m_frame_pipeline != nullptr && direct_copy &&
         source_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && source_desc.Width == desc.Width &&
@@ -111,10 +113,11 @@ bool D3D12Component::resolve_volumetric_frame(d3d12::TextureContext& target, d3d
             source_desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS);
     for (uint32_t eye = 0; valid && eye < 2; ++eye) {
         if ((probe.cropped_mask & (1u << eye)) == 0) {
+            valid = probe.baseline_rect(eye, probe.scene_rects[eye]);
             continue;
         }
         const auto& rect = probe.crops[eye].rect;
-        valid = rect.x >= 0 && rect.y >= 0 && rect.width > 0 && rect.height > 0 &&
+        valid = probe.can_crop(eye) && rect.x >= 0 && rect.y >= 0 && rect.width > 0 && rect.height > 0 &&
             rect.x <= probe.width - rect.width && rect.y <= probe.height - rect.height;
     }
     if (target.rtv_heap == nullptr) {
@@ -149,10 +152,12 @@ bool D3D12Component::resolve_volumetric_frame(d3d12::TextureContext& target, d3d
     for (uint32_t eye = 0; eye < 2; ++eye) {
         const auto crop = (probe.cropped_mask & (1u << eye)) != 0
             ? probe.crops[eye].rect : VolumetricFramePixelRect{0, 0, probe.width, probe.height};
+        const auto source_rect = (probe.cropped_mask & (1u << eye)) != 0
+            ? probe.scene_rects[eye] : VolumetricFramePixelRect{(int)eye * probe.width, 0, probe.width, probe.height};
         const int x = (int)eye * probe.width + crop.x;
         const std::array<glm::vec4, 2> constants{
             glm::vec4{(float)x, (float)crop.y, (float)crop.width, (float)crop.height},
-            glm::vec4{(float)(eye * probe.width), 0, (float)probe.width, (float)probe.height}
+            glm::vec4{(float)source_rect.x, (float)source_rect.y, (float)source_rect.width, (float)source_rect.height}
         };
         const D3D12_VIEWPORT viewport{(float)x, (float)crop.y, (float)crop.width, (float)crop.height, 0, 1};
         const D3D12_RECT scissor{x, crop.y, x + crop.width, crop.y + crop.height};
@@ -278,7 +283,7 @@ void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12
     auto& vr = VR::get();
     // Peek without consuming the render-frame association needed by xrEndFrame.
     const auto state = vr->m_openxr->get_submit_state(false);
-    const bool cropped = state.frame_probe.cropped_mask != 0;
+    const bool cropped = state.frame_probe.cropped_mask != 0 || state.frame_probe.reduced_mask != 0;
     // The layer builder runs later in this same frame. Never leave it with a
     // pose from a previous frame when the mask cannot be produced.
     vr->m_volumetric_frame_layout.active = false;
@@ -335,10 +340,10 @@ void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12
         const auto now = std::chrono::steady_clock::now();
         if (now - last_log >= std::chrono::seconds(2)) {
             last_log = now;
-            spdlog::info("[Frame Perf] submit frame={} pose={} prepared={} matched={} projections={} rects={} scene={}x{} output={}x{} native_fix={} sceneview={} splitscreen={} cropped={}",
+            spdlog::info("[Frame Perf] submit frame={} pose={} prepared={} matched={} projections={} rects={} scene={}x{} output={}x{} native_fix={} sceneview={} splitscreen={} cropped={} reduced={}",
                 state.frame_count, state.pose_frame_count, probe.prepared, use_probe, probe.projection_mask, probe.rect_mask,
                 source_desc.Width, source_desc.Height, desc.Width, desc.Height,
-                vr->is_native_stereo_fix_enabled(), vr->is_sceneview_compatibility_enabled(), vr->is_splitscreen_compatibility_enabled(), probe.cropped_mask);
+                vr->is_native_stereo_fix_enabled(), vr->is_sceneview_compatibility_enabled(), vr->is_splitscreen_compatibility_enabled(), probe.cropped_mask, probe.reduced_mask);
             spdlog::info("[Frame Perf] geometry frame={} center={},{},{} size={},{} boundsL={},{},{},{} boundsR={},{},{},{}",
                 state.frame_count, layout.pose[3].x, layout.pose[3].y, layout.pose[3].z, layout.size.x, layout.size.y,
                 probe.bounds[0].x, probe.bounds[0].y, probe.bounds[0].z, probe.bounds[0].w,
@@ -794,7 +799,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
     ComPtr<ID3D12Resource> scene_depth_tex{};
     const auto crop_state = runtime->is_openxr() ? vr->m_openxr->get_submit_state(false) : runtimes::OpenXR::PipelineState{};
-    const bool cropped_submission = crop_state.frame_crop_lost || crop_state.frame_probe.cropped_mask != 0;
+    const bool cropped_submission = crop_state.frame_crop_lost || crop_state.frame_probe.cropped_mask != 0 || crop_state.frame_probe.reduced_mask != 0;
 
     if (vr->is_depth_enabled() && runtime->is_depth_allowed() && !vr->is_volumetric_frame_enabled() && !cropped_submission) {
         auto& rt_pool = vr->get_render_target_pool_hook();

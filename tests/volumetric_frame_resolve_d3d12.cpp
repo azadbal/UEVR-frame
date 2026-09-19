@@ -187,13 +187,23 @@ int main() try {
     const auto encode = [](double value) {
         return (int)std::round(255 * (value <= .0031308 ? value * 12.92 : 1.055 * std::pow(value, 1 / 2.4) - .055));
     };
-    for (int test = 0; test < 7; ++test) {
+    for (int test = 0; test < 11; ++test) {
         const bool green = test == 5;
         const bool fail_closed = test == 6;
         std::array<std::array<int,4>,2> rects{{{31,47,181,133},{281,61,199,173}}};
         if (test == 0 || test == 3) rects[0] = {0,0,256,256};
         if (test == 0 || test == 2) rects[1] = {256,0,256,256};
         if (test == 4) rects = {{{255,0,1,256},{256,0,1,256}}};
+        std::array<std::array<int,4>,2> sources{{{0,0,256,256},{256,0,256,256}}};
+        // Reduced views occupy the top-left of each original eye allocation.
+        // Exercise both reduced eyes, mixed full/reduced views, and a 1px edge.
+        if (test == 10) rects = {{{255,255,1,1},{256,0,1,256}}};
+        for (int eye = 0; eye < 2; ++eye) {
+            if (test == 7 || test == 10 || (test == 8 && eye == 0) || (test == 9 && eye == 1)) {
+                sources[eye][2] = rects[eye][2];
+                sources[eye][3] = rects[eye][3];
+            }
+        }
         const float background[]{0,green ? 1.0f : 0.0f,0,1};
         list->ClearRenderTargetView(rtv, background, 0, nullptr);
         if (!fail_closed) {
@@ -211,7 +221,8 @@ int main() try {
             list->SetGraphicsRootDescriptorTable(1, srv_heap->GetGPUDescriptorHandleForHeapStart());
             for (int eye = 0; eye < 2; ++eye) {
                 const auto& r = rects[eye];
-                const std::array<float,8> constants{(float)r[0],(float)r[1],(float)r[2],(float)r[3],(float)(eye*256),0,256,256};
+                const auto& s = sources[eye];
+                const std::array<float,8> constants{(float)r[0],(float)r[1],(float)r[2],(float)r[3],(float)s[0],(float)s[1],(float)s[2],(float)s[3]};
                 const D3D12_VIEWPORT viewport{(float)r[0],(float)r[1],(float)r[2],(float)r[3],0,1};
                 const D3D12_RECT scissor{r[0],r[1],r[0]+r[2],r[1]+r[3]};
                 list->RSSetViewports(1, &viewport);
@@ -241,17 +252,18 @@ int main() try {
         for (int y=0; y<256; ++y) for (int x=0; x<512; ++x) {
             const int eye=x/256;
             const auto& r=rects[eye];
+            const auto& s=sources[eye];
             const bool inside=!fail_closed && x>=r[0] && y>=r[1] && x<r[0]+r[2] && y<r[1]+r[3];
             for (int c=0; c<4; ++c) {
                 int expected=c==3 ? 255 : c==1 && green ? 255 : 0;
                 if (inside) {
-                    const double sx=std::clamp((x+.5-r[0])*256/r[2]-.5,0.,255.);
-                    const double sy=std::clamp((y+.5-r[1])*256/r[3]-.5,0.,255.);
+                    const double sx=std::clamp((x+.5-r[0])*s[2]/r[2]-.5,0.,(double)s[2]-1);
+                    const double sy=std::clamp((y+.5-r[1])*s[3]/r[3]-.5,0.,(double)s[3]-1);
                     const int x0=(int)sx, y0=(int)sy;
                     const double tx=sx-x0, ty=sy-y0;
                     double value=0;
                     for (int dy=0; dy<2; ++dy) for (int dx=0; dx<2; ++dx) {
-                        const int raw=channel(eye*256+std::min(x0+dx,255),std::min(y0+dy,255),c);
+                        const int raw=channel(s[0]+std::min(x0+dx,s[2]-1),s[1]+std::min(y0+dy,s[3]-1),c);
                         value+=(dx ? tx : 1-tx)*(dy ? ty : 1-ty)*(c==3 ? raw/255. : decode(raw));
                     }
                     expected=c==3 ? (int)std::round(value*255) : encode(value);
@@ -261,7 +273,7 @@ int main() try {
                 // The alternating 40/220 sRGB pattern magnifies fixed-point
                 // sampler interpolation error. Permit three code values for
                 // resized interiors; identity mapping/background must be exact.
-                const int tolerance = inside && (r[2] != 256 || r[3] != 256) ? 3 : 0;
+                const int tolerance = inside && (r[2] != s[2] || r[3] != s[3]) ? 3 : 0;
                 if (error>tolerance) ++mismatches;
             }
         }
