@@ -2,6 +2,7 @@
 
 #include <unordered_set>
 #include <deque>
+#include <atomic>
 
 #include <d3d11.h>
 #include <d3d12.h>
@@ -218,6 +219,7 @@ public:
         uint32_t prev_frame_count{0}; // Updated right after xrWaitFrame is called
         uint32_t pose_frame_count{0};
         bool stage_pose_valid{false};
+        bool frame_crop_lost{false};
         vrmod::VolumetricFrameProbe frame_probe{};
     };
     /*std::array<std::vector<XrView>, 3> stage_view_queue{};
@@ -316,6 +318,9 @@ public:
     PipelineState get_submit_state(bool consume = true);
     void record_frame_projection(uint32_t eye, const glm::mat4& projection);
     void record_frame_view_rect(uint32_t eye, int x, int y, int width, int height);
+    struct FrameCrop { vrmod::VolumetricFramePixelRect rect; int width, height; };
+    std::optional<FrameCrop> apply_frame_crop(uint32_t eye);
+    std::atomic<bool> frame_crop_ever_applied{false};
     
     const ModSlider::Ptr resolution_scale{ ModSlider::create("OpenXR_ResolutionScale", 0.1f, 3.0f, 1.0f) };
     const ModToggle::Ptr ignore_vd_checks{ ModToggle::create("OpenXR_IgnoreVirtualDesktopChecks", false) };

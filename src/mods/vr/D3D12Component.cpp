@@ -16,6 +16,7 @@
 #include "shaders/Compiled/alpha_luminance_sprite_ps_SpriteVertexShader.inc"
 #include "shaders/Compiled/volumetric_frame_FrameVS.inc"
 #include "shaders/Compiled/volumetric_frame_FramePS.inc"
+#include "shaders/Compiled/volumetric_frame_resolve_ResolvePS.inc"
 
 #include "d3d12/DirectXTK.hpp"
 
@@ -27,6 +28,142 @@ constexpr auto ENGINE_SRC_DEPTH = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOUR
 constexpr auto ENGINE_SRC_COLOR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
 namespace vrmod {
+bool D3D12Component::setup_frame_resolve(ID3D12Device* device) {
+    if (m_frame_resolve_pipeline != nullptr) {
+        return true;
+    }
+    if (m_frame_resolve_failed || !setup_volumetric_frame(device)) {
+        return false;
+    }
+    D3D12_DESCRIPTOR_RANGE range{};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER parameters[2]{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants.Num32BitValues = 8;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[1].DescriptorTable.pDescriptorRanges = &range;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC root_desc{};
+    root_desc.NumParameters = 2;
+    root_desc.pParameters = parameters;
+    root_desc.NumStaticSamplers = 1;
+    root_desc.pStaticSamplers = &sampler;
+    ComPtr<ID3DBlob> serialized{}, error{};
+    auto result = D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &error);
+    if (SUCCEEDED(result)) {
+        result = device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&m_frame_resolve_root));
+    }
+    if (SUCCEEDED(result)) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+        desc.pRootSignature = m_frame_resolve_root.Get();
+        desc.VS = {volumetric_frame_FrameVS, sizeof(volumetric_frame_FrameVS)};
+        desc.PS = {volumetric_frame_resolve_ResolvePS, sizeof(volumetric_frame_resolve_ResolvePS)};
+        desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        desc.SampleMask = UINT_MAX;
+        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        desc.RasterizerState.DepthClipEnable = TRUE;
+        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc.NumRenderTargets = 1;
+        desc.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        desc.SampleDesc.Count = 1;
+        result = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&m_frame_resolve_pipeline));
+    }
+    if (FAILED(result)) {
+        spdlog::error("[Frame Perf] Failed to create crop resolve pipeline: {:x}", (uint32_t)result);
+        m_frame_resolve_failed = true;
+        m_frame_crop_dimensions = 0;
+        return false;
+    }
+    spdlog::info("[Frame Perf] D3D12 crop resolve pipeline ready");
+    return true;
+}
+
+bool D3D12Component::resolve_volumetric_frame(d3d12::TextureContext& target, d3d12::TextureContext* scratch,
+    ID3D12Resource* source, D3D12_RESOURCE_STATES source_state, bool direct_copy) {
+    auto& vr = VR::get();
+    const auto state = vr->m_openxr->get_submit_state(false);
+    const auto& probe = state.frame_probe;
+    if (probe.cropped_mask == 0 && !state.frame_crop_lost) {
+        return false;
+    }
+
+    // A crop already returned to Unreal must be resolved even if settings changed.
+    // Any invalid association/resources suppress this frame rather than stretching
+    // cropped rays over a full-FOV image.
+    const auto desc = target.texture->GetDesc();
+    const auto source_desc = source != nullptr ? source->GetDesc() : D3D12_RESOURCE_DESC{};
+    bool valid = !state.frame_crop_lost && probe.matches(state.frame_count, (int)desc.Width / 2, (int)desc.Height) &&
+        state.stage_views.size() == 2 && scratch != nullptr && scratch->texture != nullptr && scratch->srv_heap != nullptr &&
+        m_frame_resolve_pipeline != nullptr && m_frame_pipeline != nullptr && direct_copy &&
+        source_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && source_desc.Width == desc.Width &&
+        source_desc.Height == desc.Height && source_desc.DepthOrArraySize == 1 && source_desc.MipLevels == 1 &&
+        source_desc.SampleDesc.Count == 1 &&
+        (source_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || source_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+            source_desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS);
+    for (uint32_t eye = 0; valid && eye < 2; ++eye) {
+        if ((probe.cropped_mask & (1u << eye)) == 0) {
+            continue;
+        }
+        const auto& rect = probe.crops[eye].rect;
+        valid = rect.x >= 0 && rect.y >= 0 && rect.width > 0 && rect.height > 0 &&
+            rect.x <= probe.width - rect.width && rect.y <= probe.height - rect.height;
+    }
+    if (target.rtv_heap == nullptr) {
+        if (!target.create_rtv(g_framework->get_d3d12_hook()->get_device(), DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) {
+            m_frame_crop_dimensions = 0;
+            m_frame_resolve_failed = true;
+            spdlog::error("[Frame Perf] Cannot clear invalid cropped frame: no output RTV");
+            return true;
+        }
+    }
+    const float background[]{0, probe.green ? 1.0f : 0.0f, 0, 1};
+    auto list = target.commands.cmd_list.Get();
+    const auto rtv = target.get_rtv();
+    list->ClearRenderTargetView(rtv, background, 0, nullptr);
+    target.commands.has_commands = true;
+    if (!valid) {
+        m_frame_crop_dimensions = 0;
+        m_frame_resolve_failed = true;
+        vr->m_volumetric_frame_layout.active = false;
+        SPDLOG_ERROR_EVERY_N_SEC(1, "[Frame Perf] Cropped frame {} cannot be resolved (lost={} mask={}); showing surroundings and disabling crop until reset",
+            state.frame_count, state.frame_crop_lost, probe.cropped_mask);
+        return true;
+    }
+    target.commands.copy(source, scratch->texture.Get(), source_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    list->SetGraphicsRootSignature(m_frame_resolve_root.Get());
+    list->SetPipelineState(m_frame_resolve_pipeline.Get());
+    ID3D12DescriptorHeap* heaps[]{scratch->srv_heap->Heap()};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetGraphicsRootDescriptorTable(1, scratch->get_srv_gpu());
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        const auto crop = (probe.cropped_mask & (1u << eye)) != 0
+            ? probe.crops[eye].rect : VolumetricFramePixelRect{0, 0, probe.width, probe.height};
+        const int x = (int)eye * probe.width + crop.x;
+        const std::array<glm::vec4, 2> constants{
+            glm::vec4{(float)x, (float)crop.y, (float)crop.width, (float)crop.height},
+            glm::vec4{(float)(eye * probe.width), 0, (float)probe.width, (float)probe.height}
+        };
+        const D3D12_VIEWPORT viewport{(float)x, (float)crop.y, (float)crop.width, (float)crop.height, 0, 1};
+        const D3D12_RECT scissor{x, crop.y, x + crop.width, crop.y + crop.height};
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        list->SetGraphicsRoot32BitConstants(0, 8, constants.data(), 0);
+        list->DrawInstanced(3, 1, 0, 0);
+    }
+    return true;
+}
+
 bool D3D12Component::setup_volumetric_frame(ID3D12Device* device) {
     if (m_frame_pipeline != nullptr) {
         return true;
@@ -139,16 +276,21 @@ VolumetricFrameLayout D3D12Component::prepare_volumetric_frame(const std::array<
 
 void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12Resource* resource, ID3D12Resource* source) {
     auto& vr = VR::get();
+    // Peek without consuming the render-frame association needed by xrEndFrame.
+    const auto state = vr->m_openxr->get_submit_state(false);
+    const bool cropped = state.frame_probe.cropped_mask != 0;
     // The layer builder runs later in this same frame. Never leave it with a
     // pose from a previous frame when the mask cannot be produced.
     vr->m_volumetric_frame_layout.active = false;
-    if (!vr->is_volumetric_frame_enabled()) {
+    if (state.frame_crop_lost || (cropped && m_frame_resolve_failed) || (cropped && !state.frame_probe.matches(state.frame_count,
+            (int)resource->GetDesc().Width / 2, (int)resource->GetDesc().Height))) {
+        return;
+    }
+    if (!cropped && !vr->is_volumetric_frame_enabled()) {
         reset_volumetric_frame_anchor();
         return;
     }
 
-    // Peek without consuming the render-frame association needed by xrEndFrame.
-    const auto state = vr->m_openxr->get_submit_state(false);
     if (state.stage_views.size() != 2) {
         return;
     }
@@ -193,10 +335,10 @@ void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12
         const auto now = std::chrono::steady_clock::now();
         if (now - last_log >= std::chrono::seconds(2)) {
             last_log = now;
-            spdlog::info("[Frame Perf] submit frame={} pose={} prepared={} matched={} projections={} rects={} scene={}x{} output={}x{} native_fix={} sceneview={} splitscreen={}",
+            spdlog::info("[Frame Perf] submit frame={} pose={} prepared={} matched={} projections={} rects={} scene={}x{} output={}x{} native_fix={} sceneview={} splitscreen={} cropped={}",
                 state.frame_count, state.pose_frame_count, probe.prepared, use_probe, probe.projection_mask, probe.rect_mask,
                 source_desc.Width, source_desc.Height, desc.Width, desc.Height,
-                vr->is_native_stereo_fix_enabled(), vr->is_sceneview_compatibility_enabled(), vr->is_splitscreen_compatibility_enabled());
+                vr->is_native_stereo_fix_enabled(), vr->is_sceneview_compatibility_enabled(), vr->is_splitscreen_compatibility_enabled(), probe.cropped_mask);
             spdlog::info("[Frame Perf] geometry frame={} center={},{},{} size={},{} boundsL={},{},{},{} boundsR={},{},{},{}",
                 state.frame_count, layout.pose[3].x, layout.pose[3].y, layout.pose[3].z, layout.size.x, layout.size.y,
                 probe.bounds[0].x, probe.bounds[0].y, probe.bounds[0].z, probe.bounds[0].w,
@@ -246,7 +388,7 @@ void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12
             glm::vec4{std::tan(fov.angleLeft), std::tan(fov.angleRight), std::tan(fov.angleUp), std::tan(fov.angleDown)},
             glm::vec4{(float)x, (float)y, (float)width, (float)height},
             glm::vec4{half_width, frame_size.y * 0.5f, 0, 0},
-            glm::vec4{0, vr->m_volumetric_frame_green->value() ? 1.0f : 0.0f, 0, 1}
+            glm::vec4{0, (cropped ? probe.green : vr->m_volumetric_frame_green->value()) ? 1.0f : 0.0f, 0, 1}
         };
         static_assert(sizeof(constants) == 32 * sizeof(float));
         const D3D12_VIEWPORT viewport{(float)x, (float)y, (float)width, (float)height, 0, 1};
@@ -651,8 +793,10 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     }*/
 
     ComPtr<ID3D12Resource> scene_depth_tex{};
+    const auto crop_state = runtime->is_openxr() ? vr->m_openxr->get_submit_state(false) : runtimes::OpenXR::PipelineState{};
+    const bool cropped_submission = crop_state.frame_crop_lost || crop_state.frame_probe.cropped_mask != 0;
 
-    if (vr->is_depth_enabled() && runtime->is_depth_allowed() && !vr->is_volumetric_frame_enabled()) {
+    if (vr->is_depth_enabled() && runtime->is_depth_allowed() && !vr->is_volumetric_frame_enabled() && !cropped_submission) {
         auto& rt_pool = vr->get_render_target_pool_hook();
         scene_depth_tex = rt_pool->get_texture<ID3D12Resource>(L"SceneDepthZ");
 
@@ -1275,6 +1419,7 @@ void D3D12Component::on_post_present(VR* vr) {
 }
 
 void D3D12Component::on_reset(VR* vr) {
+    m_frame_crop_dimensions = 0;
     m_force_reset = true;
     vr->m_volumetric_frame_layout.active = false;
 
@@ -1350,6 +1495,9 @@ void D3D12Component::on_reset(VR* vr) {
 
     m_frame_pipeline.Reset();
     m_frame_root.Reset();
+    m_frame_resolve_pipeline.Reset();
+    m_frame_resolve_root.Reset();
+    m_frame_resolve_failed = false;
     m_frame_mask_failed = false;
     reset_volumetric_frame_anchor();
     m_prev_backbuffer.Reset();
@@ -1860,6 +2008,7 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
 
 void D3D12Component::OpenXR::destroy_swapchains() {
     std::scoped_lock _{this->mtx};
+    VR::get()->d3d12().m_frame_crop_dimensions = 0;
 
     if (this->contexts.empty()) {
         return;
@@ -1884,6 +2033,7 @@ void D3D12Component::OpenXR::destroy_swapchains() {
         }
 
         ctx.texture_contexts.clear();
+        ctx.frame_scratch.clear();
 
         std::vector<ID3D12Resource*> needs_release{};
 
@@ -1995,13 +2145,69 @@ void D3D12Component::OpenXR::copy(
             auto& texture_ctx = ctx.texture_contexts[texture_index];
             texture_ctx->commands.wait(INFINITE);
 
+            const bool double_wide = swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE;
+            auto& component = vr->d3d12();
+            if (double_wide) {
+                texture_ctx->texture = ctx.textures[texture_index].texture;
+                // Prepare every image before allowing a projection hook to crop.
+                // Scratch is never resized/replaced while an output fence uses it.
+                if (vr->is_frame_crop_requested() && !component.m_frame_resolve_failed &&
+                    component.m_frame_crop_dimensions == 0 && resource != nullptr &&
+                    src_box == nullptr && !pre_commands && !additional_commands) {
+                    auto device = g_framework->get_d3d12_hook()->get_device();
+                    const auto desc = texture_ctx->texture->GetDesc();
+                    const auto source_desc = resource->GetDesc();
+                    bool ready = desc.SampleDesc.Count == 1 && desc.DepthOrArraySize == 1 && desc.MipLevels == 1 &&
+                        source_desc.Width == desc.Width && source_desc.Height == desc.Height &&
+                        source_desc.SampleDesc.Count == 1 && source_desc.DepthOrArraySize == 1 && source_desc.MipLevels == 1 &&
+                        (source_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || source_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                            source_desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS) && component.setup_frame_resolve(device);
+                    if (ready) {
+                        ctx.frame_scratch.resize(ctx.textures.size());
+                        for (size_t image = 0; ready && image < ctx.textures.size(); ++image) {
+                            auto& output = *ctx.texture_contexts[image];
+                            output.commands.wait(INFINITE);
+                            output.texture = ctx.textures[image].texture;
+                            ready = output.rtv_heap != nullptr || output.create_rtv(device, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+                            if (ready && ctx.frame_scratch[image] == nullptr) {
+                                auto scratch = std::make_unique<d3d12::TextureContext>();
+                                auto scratch_desc = desc;
+                                scratch_desc.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+                                scratch_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+                                D3D12_HEAP_PROPERTIES heap{};
+                                heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+                                ready = SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &scratch_desc,
+                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&scratch->texture))) &&
+                                    scratch->create_srv(device, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+                                if (ready) {
+                                    scratch->texture->SetName(L"Aperture crop resolve scratch");
+                                    ctx.frame_scratch[image] = std::move(scratch);
+                                }
+                            }
+                        }
+                        if (!ready) {
+                            component.m_frame_resolve_failed = true;
+                            spdlog::error("[Frame Perf] Crop scratch/RTV allocation failed; retaining full projections");
+                        }
+                    }
+                    if (ready) {
+                        component.m_frame_crop_dimensions = ((uint64_t)(uint32_t)(desc.Width / 2) << 32) | desc.Height;
+                        spdlog::info("[Frame Perf] Crop resolve ready for {}x{} per eye ({} fenced images)", desc.Width / 2, desc.Height, ctx.textures.size());
+                    }
+                }
+            }
+
             if (pre_commands) {
                 (*pre_commands)(texture_ctx->commands, ctx.textures[texture_index].texture);
             }
 
+            const bool resolved = double_wide && component.resolve_volumetric_frame(*texture_ctx,
+                texture_index < ctx.frame_scratch.size() ? ctx.frame_scratch[texture_index].get() : nullptr,
+                resource, src_state, src_box == nullptr && !pre_commands && !additional_commands);
+
             // We may simply just want to render to the render target directly
             // hence, a null resource is allowed.
-            if (resource != nullptr) {
+            if (resource != nullptr && !resolved) {
                 if (src_box == nullptr) {
                     const auto is_depth = swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::DEPTH || 
                                         swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_DEPTH_LEFT_EYE || 
@@ -2022,7 +2228,7 @@ void D3D12Component::OpenXR::copy(
                 }
             }
 
-            if (additional_commands) {
+            if (additional_commands && !resolved) {
                 (*additional_commands)(texture_ctx->commands);
             }
 

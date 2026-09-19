@@ -7,7 +7,6 @@
 
 namespace vrmod {
 
-// Diagnostic only: proposals never replace engine projections or scene sizes.
 // Stored with OpenXR's pose queue, not in a global "latest frame" variable.
 struct VolumetricFrameProbe {
     uint32_t pose_frame{0};
@@ -20,6 +19,16 @@ struct VolumetricFrameProbe {
     std::array<VolumetricFramePixelRect, 2> scene_rects{};
     uint32_t projection_mask{0};
     uint32_t rect_mask{0};
+    bool crop_requested{false};
+    bool green{false};
+    uint32_t cropped_mask{0}; // Only eyes whose returned projection was changed.
+
+    bool can_crop(uint32_t eye) const {
+        if (eye >= 2 || !prepared || !layout.active || !crop_requested ||
+            !(rect_mask & (1u << eye)) || crops[eye].fallback != VolumetricFrameCropFallback::NONE) return false;
+        const auto& rect = scene_rects[eye];
+        return rect.x == (int)eye * width && rect.y == 0 && rect.width == width && rect.height == height;
+    }
 
     bool matches(uint32_t frame, int output_width, int output_height) const {
         return prepared && layout.active && pose_frame == frame &&

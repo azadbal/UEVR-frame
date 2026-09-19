@@ -2,10 +2,11 @@
 
 2026-09-18. Design and standalone math validation only; no runtime optimization, source build, game run, or speedup measurement is included in this work.
 
-Implementation update: [Prototype 04](volumetric-frame-prototype-04.md) now
-provides the opt-in runtime observation stage and a Release build. Projection
-cropping/resolve and reduced scene sizes are still unimplemented. Headset
-association/appearance verification is the next gate; no speedup is measured.
+Implementation update: [Prototype 04](volumetric-frame-prototype-04.md) provides
+runtime observation, with a first FluidFlux log analyzed. [Prototype 05](volumetric-frame-prototype-05.md)
+implements opt-in projection cropping and full-size color resolve, with local
+Release/GPU checks passing. Game appearance/culling verification is the next
+gate. Reduced scene sizes remain unimplemented; no speedup is measured.
 
 ## Target and boundaries
 

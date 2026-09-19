@@ -80,4 +80,35 @@ milliseconds only after visual equivalence, with diagnostic logging disabled.
 - Existing anchor regression passes.
 - Existing D3D12 WARP mask harness passes all nine cases with zero pixel
   mismatches and no debug-layer errors. The mask shader is unchanged.
-- No headset run, engine-culling result or performance measurement yet.
+- At build time, headset verification was pending; no engine-culling result or
+  performance measurement was available.
+
+## First FluidFlux diagnostic run
+
+2026-09-18, 18:20:57.965–18:21:52.161 local time. User reported completing the
+headset check. Read the local log and archived its diagnostic records plus a
+machine-readable summary under `build/diagnostics/prototype04-2026-09-18/`.
+
+- 28 rate-limited submission samples: 26 matched the early snapshot with both
+  eye projection and view-rectangle bits present (`projections=3 rects=3`).
+- Two samples used the baseline path: initial `frame=0 pose=1`, and frame
+  2190 at 18:21:16.012, where no early probe was prepared. The latter's cause
+  is not identified by these records; a diagnostics-toggle transition is
+  possible but not established. Later samples resumed matching.
+- Full scene/output remained 5376 x 2880, or 2688 x 2880 per eye.
+- Across the 26 matched stereo samples, mean left/right candidate area ranged
+  from 33.84% to 49.70% of full stereo output, median 37.43%. All 52 matched
+  eye candidates had fallback code 0. Regions include the 16-pixel guard.
+- Geometry records show recenter placement changes and return to the matched
+  UI rectangle; sampled projections and output dimensions stayed unchanged.
+- One unrelated input-hook timeout was logged (`dinput8.dll` failed to load
+  in time). No frame-mask initialization failure was logged during this run.
+
+Interpretation: the normal both-eye capture/submission route works in this
+demo's current configuration. These are sparse samples, not a per-frame
+reliability measurement, image-equivalence proof, or benchmark. Roughly 63%
+of output lies outside the median candidate rectangle; this only motivates
+future pixel-work reduction, not a 63% frame-time/FPS prediction. The next
+projection/resolve experiment must retain a per-frame full-view fallback,
+including transitions with no prepared probe. Narrowing/culling and actual
+CPU/GPU gains remain untested.

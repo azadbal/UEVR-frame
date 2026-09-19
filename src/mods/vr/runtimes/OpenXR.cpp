@@ -219,6 +219,10 @@ VRRuntime::Error OpenXR::update_poses(bool from_view_extensions, uint32_t frame_
     }
 
     auto& pipeline_state = this->pipeline_states[frame_count % OpenXR::QUEUE_SIZE];
+    // A same-frame pose replacement cannot discard an already returned crop.
+    // Suppress that submission instead of presenting it with a new mapping.
+    pipeline_state.frame_crop_lost = pipeline_state.pose_frame_count == frame_count &&
+        (pipeline_state.frame_probe.cropped_mask != 0 || pipeline_state.frame_crop_lost);
     pipeline_state.pose_frame_count = frame_count;
     pipeline_state.stage_pose_valid = false;
     pipeline_state.frame_probe = {};
@@ -706,11 +710,13 @@ OpenXR::PipelineState OpenXR::get_submit_state(bool consume) {
             // Compare with the requested render frame, not only with the slot.
             last_submit_state.frame_probe = {};
             last_submit_state.stage_pose_valid = false;
+            last_submit_state.frame_crop_lost = frame_crop_ever_applied.load();
         }
     } else {
         // No rendered-frame association: never reuse a previous frame's probe.
         last_submit_state.frame_probe = {};
         last_submit_state.stage_pose_valid = false;
+        last_submit_state.frame_crop_lost = frame_crop_ever_applied.load();
         last_submit_state.stage_views = get_current_stage_view();
         last_submit_state.view_space_location = this->view_space_location;
         last_submit_state.frame_state = this->frame_state;
@@ -774,7 +780,12 @@ void OpenXR::record_frame_projection(uint32_t eye, const glm::mat4& projection) 
     probe.pose_frame = frame;
     probe.width = (int)vr->get_hmd_width();
     probe.height = (int)vr->get_hmd_height();
-    probe.layout = vr->d3d12().prepare_volumetric_frame(eyes);
+    if (vr->is_volumetric_frame_enabled()) {
+        probe.layout = vr->d3d12().prepare_volumetric_frame(eyes);
+    }
+    probe.crop_requested = vr->is_frame_crop_requested() && !captured.frame_crop_lost &&
+        vr->d3d12().frame_crop_ready(probe.width, probe.height);
+    probe.green = vr->is_volumetric_frame_green();
     probe.bounds = bounds;
     probe.prepared = true;
     for (uint32_t i = 0; i < 2; ++i) {
@@ -795,6 +806,17 @@ void OpenXR::record_frame_projection(uint32_t eye, const glm::mat4& projection) 
         if (state.pose_frame_count != frame || !state.stage_pose_valid) return;
         state.frame_probe = probe;
     }
+}
+
+std::optional<OpenXR::FrameCrop> OpenXR::apply_frame_crop(uint32_t eye) {
+    std::scoped_lock lock{sync_assignment_mtx};
+    auto& state = pipeline_states[internal_frame_count % QUEUE_SIZE];
+    auto& probe = state.frame_probe;
+    if (state.pose_frame_count != internal_frame_count || state.frame_crop_lost ||
+        !probe.can_crop(eye)) return std::nullopt;
+    probe.cropped_mask |= 1u << eye;
+    frame_crop_ever_applied = true;
+    return FrameCrop{probe.crops[eye].rect, probe.width, probe.height};
 }
 
 
@@ -1827,6 +1849,8 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
     }
 
     const auto submit_state = this->get_submit_state();
+    // Depth has not been resolved back to full-FOV pixels by this experiment.
+    has_depth = has_depth && !submit_state.frame_crop_lost && submit_state.frame_probe.cropped_mask == 0;
     const auto& pipelined_stage_views = submit_state.stage_views;
     const auto& pipelined_frame_state = submit_state.frame_state;
 

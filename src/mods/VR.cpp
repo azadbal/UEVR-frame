@@ -2428,9 +2428,13 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 m_volumetric_frame_recenter = true;
             }
             ImGui::TextWrapped("Black surroundings when green is off. Depth submission is disabled while the frame is active. Matching uses a fixed 16:9 portal rectangle.");
-            m_volumetric_frame_diagnostics->draw("Performance Diagnostics (no optimization yet)");
+            m_volumetric_frame_crop->draw("Experimental Projection Crop");
+            if (m_volumetric_frame_crop->value()) {
+                ImGui::TextWrapped("Narrows the game views through the frame. Scene resolution stays unchanged for this test. Turn off Native Stereo Fix, SceneView and SplitScreen compatibility. Disable this option if the image looks wrong.");
+            }
+            m_volumetric_frame_diagnostics->draw("Performance Diagnostics");
             if (m_volumetric_frame_diagnostics->value()) {
-                ImGui::TextWrapped("Records proposed rendering bounds in the UEVR log. Game resolution and rendering stay unchanged.");
+                ImGui::TextWrapped("Records rendering bounds and crop decisions in the UEVR log.");
             }
             ImGui::TreePop();
         }

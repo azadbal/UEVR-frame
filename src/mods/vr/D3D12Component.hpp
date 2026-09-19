@@ -48,6 +48,10 @@ public:
     auto& openxr() { return m_openxr; }
     auto& get_openvr_ui_tex() { return m_openvr.ui_tex; }
     bool volumetric_frame_failed() const { return m_frame_mask_failed; }
+    bool frame_crop_ready(int width, int height) const {
+        return width > 0 && height > 0 && m_frame_crop_dimensions.load() ==
+            ((uint64_t)(uint32_t)width << 32 | (uint32_t)height);
+    }
     VolumetricFrameLayout prepare_volumetric_frame(const std::array<glm::mat4, 2>& eyes);
 
 private:
@@ -62,6 +66,9 @@ private:
     void clear_backbuffer();
     void draw_volumetric_frame(d3d12::TextureContext& target, ID3D12Resource* resource, ID3D12Resource* source);
     bool setup_volumetric_frame(ID3D12Device* device);
+    bool setup_frame_resolve(ID3D12Device* device);
+    bool resolve_volumetric_frame(d3d12::TextureContext& target, d3d12::TextureContext* scratch,
+        ID3D12Resource* source, D3D12_RESOURCE_STATES source_state, bool direct_copy);
     void reset_volumetric_frame_anchor();
 
     template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
@@ -69,6 +76,10 @@ private:
     ComPtr<ID3D12Resource> m_prev_backbuffer{};
     ComPtr<ID3D12RootSignature> m_frame_root{};
     ComPtr<ID3D12PipelineState> m_frame_pipeline{};
+    ComPtr<ID3D12RootSignature> m_frame_resolve_root{};
+    ComPtr<ID3D12PipelineState> m_frame_resolve_pipeline{};
+    std::atomic<uint64_t> m_frame_crop_dimensions{0};
+    bool m_frame_resolve_failed{false};
     glm::mat4 m_frame_anchor{1.0f};
     std::mutex m_frame_anchor_mtx{};
     bool m_frame_was_enabled{false};
@@ -217,6 +228,8 @@ private:
         struct SwapchainContext {
             std::vector<XrSwapchainImageD3D12KHR> textures{};
             std::vector<std::unique_ptr<d3d12::TextureContext>> texture_contexts{};
+            // Used only by DOUBLE_WIDE. Each scratch shares its output's command fence.
+            std::vector<std::unique_ptr<d3d12::TextureContext>> frame_scratch{};
             uint32_t num_textures_acquired{0};
             uint32_t last_acquired_texture{0};
             bool ever_acquired{false};

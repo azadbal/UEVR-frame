@@ -30,6 +30,7 @@ call :CompileShader alpha_luminance_sprite_ps ps SpritePixelShader
 call :CompileShader alpha_luminance_sprite_ps vs SpriteVertexShader
 call :CompileShader volumetric_frame vs FrameVS
 call :CompileShader volumetric_frame ps FramePS
+call :CompileShader volumetric_frame_resolve ps ResolvePS
 
 if %error% == 0 (
     echo Shaders compiled ok

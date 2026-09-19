@@ -4740,7 +4740,9 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
     if (!VR::get()->is_native_stereo_fix_enabled()) {
         *x += *w * true_index;
     }
-    if (VR::get()->is_volumetric_frame_enabled() && VR::get()->m_volumetric_frame_diagnostics->value()) {
+    if (VR::get()->get_runtime()->is_openxr() && ((VR::get()->is_volumetric_frame_enabled() &&
+        (VR::get()->m_volumetric_frame_diagnostics->value() || VR::get()->m_volumetric_frame_crop->value())) ||
+        VR::get()->m_openxr->frame_crop_ever_applied.load())) {
         VR::get()->m_openxr->record_frame_view_rect(true_index, *x, *y, (int)*w, (int)*h);
     }
 }
@@ -5190,11 +5192,20 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
             const auto fmat = VR::get()->get_projection_matrix((VRRuntime::Eye)(true_index));
             double_matrix = fmat;
         }
-        if (vr->is_volumetric_frame_enabled() && vr->m_volumetric_frame_diagnostics->value()) {
-            // Observe exactly the matrix returned to UE, before visibility.
-            // Both float and UE5 double paths remain completely unchanged.
+        if (vr->get_runtime()->is_openxr() && ((vr->is_volumetric_frame_enabled() &&
+            (vr->m_volumetric_frame_diagnostics->value() || vr->m_volumetric_frame_crop->value())) ||
+            vr->m_openxr->frame_crop_ever_applied.load())) {
             const glm::mat4 baseline = g_hook->m_has_double_precision ? glm::mat4{double_matrix} : *out;
             vr->m_openxr->record_frame_projection(true_index, baseline);
+            if (const auto crop = vr->m_openxr->apply_frame_crop(true_index)) {
+                // Preserve the engine matrix's depth rows and precision. Runtime
+                // FOV/poses stay full-size; the submitted color is resolved back.
+                if (g_hook->m_has_double_precision) {
+                    double_matrix = vrmod::crop_volumetric_frame_projection(double_matrix, crop->rect, crop->width, crop->height);
+                } else {
+                    *out = vrmod::crop_volumetric_frame_projection(*out, crop->rect, crop->width, crop->height);
+                }
+            }
         }
     } else {
         SPDLOG_ERROR("CalculateStereoProjectionMatrix returned nullptr!");
