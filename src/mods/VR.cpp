@@ -2428,6 +2428,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 m_volumetric_frame_recenter = true;
             }
             ImGui::TextWrapped("Black surroundings when green is off. Depth submission is disabled while the frame is active. Matching uses a fixed 16:9 portal rectangle.");
+            m_volumetric_frame_diagnostics->draw("Performance Diagnostics (no optimization yet)");
+            if (m_volumetric_frame_diagnostics->value()) {
+                ImGui::TextWrapped("Records proposed rendering bounds in the UEVR log. Game resolution and rendering stay unchanged.");
+            }
             ImGui::TreePop();
         }
 

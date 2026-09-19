@@ -20,6 +20,7 @@
 #include "Mod.hpp"
 
 #include "VRRuntime.hpp"
+#include "../VolumetricFrameProbe.hpp"
 
 namespace runtimes{
 struct OpenXR final : public VRRuntime {
@@ -215,6 +216,9 @@ public:
         std::vector<XrView> stage_views{};
         uint32_t frame_count{0}; // Updated on game thread prior to rendering
         uint32_t prev_frame_count{0}; // Updated right after xrWaitFrame is called
+        uint32_t pose_frame_count{0};
+        bool stage_pose_valid{false};
+        vrmod::VolumetricFrameProbe frame_probe{};
     };
     /*std::array<std::vector<XrView>, 3> stage_view_queue{};
     std::array<XrSpaceLocation, 3> view_space_location_queue{};
@@ -310,6 +314,8 @@ public:
 
     PipelineState last_submit_state{};
     PipelineState get_submit_state(bool consume = true);
+    void record_frame_projection(uint32_t eye, const glm::mat4& projection);
+    void record_frame_view_rect(uint32_t eye, int x, int y, int width, int height);
     
     const ModSlider::Ptr resolution_scale{ ModSlider::create("OpenXR_ResolutionScale", 0.1f, 3.0f, 1.0f) };
     const ModToggle::Ptr ignore_vd_checks{ ModToggle::create("OpenXR_IgnoreVirtualDesktopChecks", false) };

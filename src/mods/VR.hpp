@@ -588,8 +588,8 @@ public:
 
     std::atomic<bool> m_volumetric_frame_recenter{true};
 
-    // This is deliberately transient: it is rebuilt by the D3D12 mask path and
-    // consumed by the OpenXR Slate layer in the same submitted frame.
+    // Published by the D3D12 mask for the Slate layer in this submitted frame.
+    // Diagnostics can supply its geometry from the earlier projection snapshot.
     vrmod::VolumetricFrameLayout m_volumetric_frame_layout{};
 
     bool is_roomscale_enabled() const {
@@ -917,6 +917,7 @@ private:
     const ModToggle::Ptr m_volumetric_frame_match_ui{ ModToggle::create(generate_name("VolumetricFrameMatchUI"), true) };
     const ModToggle::Ptr m_volumetric_frame_move_ui{ ModToggle::create(generate_name("VolumetricFrameMoveUI"), true) };
     const ModToggle::Ptr m_volumetric_frame_green{ ModToggle::create(generate_name("VolumetricFrameGreen"), false) };
+    const ModToggle::Ptr m_volumetric_frame_diagnostics{ ModToggle::create(generate_name("VolumetricFrameDiagnostics"), false) };
     const ModToggle::Ptr m_roomscale_movement{ ModToggle::create(generate_name("RoomscaleMovement"), false) };
     const ModToggle::Ptr m_roomscale_sweep{ ModToggle::create(generate_name("RoomscaleMovementSweep"), true) };
     const ModToggle::Ptr m_swap_controllers{ ModToggle::create(generate_name("SwapControllerInputs"), false) };
@@ -1069,6 +1070,7 @@ public:
             *m_volumetric_frame_match_ui,
             *m_volumetric_frame_move_ui,
             *m_volumetric_frame_green,
+            *m_volumetric_frame_diagnostics,
             *m_roomscale_movement,
             *m_roomscale_sweep,
             *m_swap_controllers,

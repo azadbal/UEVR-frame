@@ -219,6 +219,9 @@ VRRuntime::Error OpenXR::update_poses(bool from_view_extensions, uint32_t frame_
     }
 
     auto& pipeline_state = this->pipeline_states[frame_count % OpenXR::QUEUE_SIZE];
+    pipeline_state.pose_frame_count = frame_count;
+    pipeline_state.stage_pose_valid = false;
+    pipeline_state.frame_probe = {};
 
     if (pipeline_state.frame_state.predictedDisplayTime <= 1000) {
         pipeline_state.frame_state = this->frame_state;
@@ -285,6 +288,8 @@ VRRuntime::Error OpenXR::update_poses(bool from_view_extensions, uint32_t frame_
     }
 
     pipeline_state.stage_views = this->stage_views;
+    constexpr auto pose_flags = XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT;
+    const bool stage_valid = view_count == 2 && (this->stage_view_state.viewStateFlags & pose_flags) == pose_flags;
     //this->frame_state_queue[frame_count % this->frame_state_queue.size()] = this->frame_state;
     
     if (should_enqueue) {
@@ -304,6 +309,8 @@ VRRuntime::Error OpenXR::update_poses(bool from_view_extensions, uint32_t frame_
     }
 
     pipeline_state.view_space_location = this->view_space_location;
+    constexpr auto head_flags = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    pipeline_state.stage_pose_valid = stage_valid && (this->view_space_location.locationFlags & head_flags) == head_flags;
 
     for (auto i = 0; i < this->hands.size(); ++i) {
         auto& hand = this->hands[i];
@@ -694,7 +701,16 @@ OpenXR::PipelineState OpenXR::get_submit_state(bool consume) {
 
     if (this->has_render_frame_count) {
         last_submit_state = this->pipeline_states[this->internal_render_frame_count % QUEUE_SIZE];
+        if (last_submit_state.pose_frame_count != this->internal_render_frame_count) {
+            // A queue slot can have wrapped even when its own fields agree.
+            // Compare with the requested render frame, not only with the slot.
+            last_submit_state.frame_probe = {};
+            last_submit_state.stage_pose_valid = false;
+        }
     } else {
+        // No rendered-frame association: never reuse a previous frame's probe.
+        last_submit_state.frame_probe = {};
+        last_submit_state.stage_pose_valid = false;
         last_submit_state.stage_views = get_current_stage_view();
         last_submit_state.view_space_location = this->view_space_location;
         last_submit_state.frame_state = this->frame_state;
@@ -710,6 +726,75 @@ OpenXR::PipelineState OpenXR::get_submit_state(bool consume) {
     }*/
 
     return last_submit_state;
+}
+
+void OpenXR::record_frame_view_rect(uint32_t eye, int x, int y, int width, int height) {
+    if (eye >= 2) return;
+    std::scoped_lock lock{sync_assignment_mtx};
+    auto& state = pipeline_states[internal_frame_count % QUEUE_SIZE];
+    if (state.pose_frame_count != internal_frame_count || !state.stage_pose_valid) return;
+    state.frame_probe.scene_rects[eye] = {x, y, width, height};
+    state.frame_probe.rect_mask |= 1u << eye;
+}
+
+void OpenXR::record_frame_projection(uint32_t eye, const glm::mat4& projection) {
+    if (eye >= 2) return;
+    auto& vr = VR::get();
+    // Copy poses under the queue lock, release it before accessing VR settings
+    // and its anchor, then verify that the queue slot still describes this pose.
+    PipelineState captured{};
+    uint32_t frame{};
+    std::array<glm::vec4, 2> bounds{};
+    {
+        std::scoped_lock lock{sync_assignment_mtx};
+        frame = internal_frame_count;
+        auto& state = pipeline_states[frame % QUEUE_SIZE];
+        if (state.pose_frame_count != frame || !state.stage_pose_valid || state.stage_views.size() != 2) return;
+        if (state.frame_probe.prepared) {
+            state.frame_probe.projections[eye] = projection;
+            state.frame_probe.projection_mask |= 1u << eye;
+            return;
+        }
+        captured = state;
+    }
+    // update_matrices writes these bounds under pose_mtx.
+    {
+        std::shared_lock lock{pose_mtx};
+        for (uint32_t i = 0; i < 2; ++i) {
+            bounds[i] = {view_bounds[i][0], view_bounds[i][1], view_bounds[i][2], view_bounds[i][3]};
+        }
+    }
+    std::array<glm::mat4, 2> eyes{};
+    for (uint32_t i = 0; i < 2; ++i) {
+        const auto& pose = captured.stage_views[i].pose;
+        eyes[i] = glm::mat4_cast(to_glm(pose.orientation));
+        eyes[i][3] = glm::vec4{pose.position.x, pose.position.y, pose.position.z, 1.0f};
+    }
+    auto probe = captured.frame_probe;
+    probe.pose_frame = frame;
+    probe.width = (int)vr->get_hmd_width();
+    probe.height = (int)vr->get_hmd_height();
+    probe.layout = vr->d3d12().prepare_volumetric_frame(eyes);
+    probe.bounds = bounds;
+    probe.prepared = true;
+    for (uint32_t i = 0; i < 2; ++i) {
+        const auto& fov = captured.stage_views[i].fov;
+        const glm::vec4 tangents{std::tan(fov.angleLeft), std::tan(fov.angleRight), std::tan(fov.angleUp), std::tan(fov.angleDown)};
+        const int x = (int)(bounds[i][0] * probe.width);
+        const int y = (int)(bounds[i][2] * probe.height);
+        const vrmod::VolumetricFramePixelRect submitted{x, y,
+            (int)(bounds[i][1] * probe.width) - x, (int)(bounds[i][3] * probe.height) - y};
+        probe.crops[i] = vrmod::calculate_volumetric_frame_crop(
+            probe.layout.pose, probe.layout.size, eyes[i], tangents, submitted, probe.width, probe.height);
+    }
+    probe.projections[eye] = projection;
+    probe.projection_mask |= 1u << eye;
+    {
+        std::scoped_lock lock{sync_assignment_mtx};
+        auto& state = pipeline_states[frame % QUEUE_SIZE];
+        if (state.pose_frame_count != frame || !state.stage_pose_valid) return;
+        state.frame_probe = probe;
+    }
 }
 
 
@@ -1826,6 +1911,18 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
             }
             offset_y = view_bounds[i][2] * swapchain->height;
             extent_y = view_bounds[i][3] * swapchain->height - offset_y;
+
+            // Match the diagnostic snapshot consumed by the mask. No crop is
+            // submitted: these remain the original full-FOV image bounds.
+            const auto& probe = submit_state.frame_probe;
+            if (!is_afr && probe.matches(submit_state.frame_count, texture_area_width, swapchain->height)) {
+                const auto& bounds = probe.bounds[i];
+                const int x = (int)(bounds[0] * texture_area_width);
+                offset_x = i * texture_area_width + x;
+                extent_x = (int)(bounds[1] * texture_area_width) - x;
+                offset_y = (int)(bounds[2] * swapchain->height);
+                extent_y = (int)(bounds[3] * swapchain->height) - offset_y;
+            }
             
             // SPDLOG_INFO("image calc for eye {} {}, {}, {}, {}", i, offset_x, extent_x, offset_y, extent_y);
             projection_layer_views[i].subImage.imageRect.offset = {offset_x, offset_y};

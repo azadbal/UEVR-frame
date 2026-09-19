@@ -2,6 +2,11 @@
 
 2026-09-18. Design and standalone math validation only; no runtime optimization, source build, game run, or speedup measurement is included in this work.
 
+Implementation update: [Prototype 04](volumetric-frame-prototype-04.md) now
+provides the opt-in runtime observation stage and a Release build. Projection
+cropping/resolve and reduced scene sizes are still unimplemented. Headset
+association/appearance verification is the next gate; no speedup is measured.
+
 ## Target and boundaries
 
 Preserve the current native 6DoF, full-FOV projection output with the physical aperture mask. Render fewer engine rays through a conservative rectangular bound of that aperture, then resolve them back into their original full-FOV pixel positions before the exact mask. Preserve head translation, rotation, eye separation, aperture placement, and black/green surroundings. Ignore desktop FOV. The stereo-quad/full-picture recommendation in the earlier [research note](volumetric-frame-performance-research.md) is historical and is not the selected experiment.

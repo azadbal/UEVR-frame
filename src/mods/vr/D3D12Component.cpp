@@ -74,48 +74,15 @@ bool D3D12Component::setup_volumetric_frame(ID3D12Device* device) {
     return true;
 }
 
-void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12Resource* resource) {
+void D3D12Component::reset_volumetric_frame_anchor() {
+    std::scoped_lock lock{m_frame_anchor_mtx};
+    m_frame_was_enabled = false;
+    m_frame_was_ui_matched = false;
+}
+
+VolumetricFrameLayout D3D12Component::prepare_volumetric_frame(const std::array<glm::mat4, 2>& eyes) {
+    std::scoped_lock lock{m_frame_anchor_mtx};
     auto& vr = VR::get();
-    // The layer builder runs later in this same frame. Never leave it with a
-    // pose from a previous frame when the mask cannot be produced.
-    vr->m_volumetric_frame_layout.active = false;
-    if (!vr->is_volumetric_frame_enabled()) {
-        m_frame_was_enabled = false;
-        m_frame_was_ui_matched = false;
-        return;
-    }
-
-    // Peek without consuming the render-frame association needed by xrEndFrame.
-    const auto state = vr->m_openxr->get_submit_state(false);
-    if (state.stage_views.size() != 2) {
-        return;
-    }
-    const auto desc = resource->GetDesc();
-    auto device = g_framework->get_d3d12_hook()->get_device();
-    if (desc.SampleDesc.Count != 1) {
-        if (!m_frame_mask_failed) {
-            spdlog::error("[Volumetric Frame] Multisampled swapchains are unsupported");
-        }
-        m_frame_mask_failed = true;
-        return;
-    }
-    if (!setup_volumetric_frame(device)) {
-        return;
-    }
-    if (target.rtv_heap == nullptr) {
-        target.texture = resource;
-        if (!target.create_rtv(device, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) {
-            m_frame_mask_failed = true;
-            return;
-        }
-    }
-
-    auto pose_matrix = [](const XrPosef& pose) {
-        auto matrix = glm::mat4_cast(glm::quat{pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z});
-        matrix[3] = glm::vec4{pose.position.x, pose.position.y, pose.position.z, 1.0f};
-        return matrix;
-    };
-    const std::array<glm::mat4, 2> eyes{pose_matrix(state.stage_views[0].pose), pose_matrix(state.stage_views[1].pose)};
     const bool recenter = vr->m_volumetric_frame_recenter.exchange(false);
 
     const auto make_slate_anchor = [&]() {
@@ -167,9 +134,87 @@ void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12
             0.0f,
             0.0f);
 
-    vr->m_volumetric_frame_layout.pose = frame_pose;
-    vr->m_volumetric_frame_layout.size = frame_size;
-    vr->m_volumetric_frame_layout.active = true;
+    return {frame_pose, frame_size, true};
+}
+
+void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12Resource* resource, ID3D12Resource* source) {
+    auto& vr = VR::get();
+    // The layer builder runs later in this same frame. Never leave it with a
+    // pose from a previous frame when the mask cannot be produced.
+    vr->m_volumetric_frame_layout.active = false;
+    if (!vr->is_volumetric_frame_enabled()) {
+        reset_volumetric_frame_anchor();
+        return;
+    }
+
+    // Peek without consuming the render-frame association needed by xrEndFrame.
+    const auto state = vr->m_openxr->get_submit_state(false);
+    if (state.stage_views.size() != 2) {
+        return;
+    }
+    const auto desc = resource->GetDesc();
+    auto device = g_framework->get_d3d12_hook()->get_device();
+    if (desc.SampleDesc.Count != 1) {
+        if (!m_frame_mask_failed) {
+            spdlog::error("[Volumetric Frame] Multisampled swapchains are unsupported");
+        }
+        m_frame_mask_failed = true;
+        return;
+    }
+    if (!setup_volumetric_frame(device)) {
+        return;
+    }
+    if (target.rtv_heap == nullptr) {
+        target.texture = resource;
+        if (!target.create_rtv(device, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) {
+            m_frame_mask_failed = true;
+            return;
+        }
+    }
+
+    auto pose_matrix = [](const XrPosef& pose) {
+        auto matrix = glm::mat4_cast(glm::quat{pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z});
+        matrix[3] = glm::vec4{pose.position.x, pose.position.y, pose.position.z, 1.0f};
+        return matrix;
+    };
+    const std::array<glm::mat4, 2> eyes{pose_matrix(state.stage_views[0].pose), pose_matrix(state.stage_views[1].pose)};
+    const auto& probe = state.frame_probe;
+    const bool use_probe = probe.matches(state.frame_count, (int)desc.Width / 2, (int)desc.Height);
+    const auto layout = use_probe ? probe.layout : prepare_volumetric_frame(eyes);
+    vr->m_volumetric_frame_layout = layout;
+    const auto& frame_pose = layout.pose;
+    const auto& frame_size = layout.size;
+
+    if (vr->m_volumetric_frame_diagnostics->value()) {
+        const auto source_desc = source != nullptr ? source->GetDesc() : D3D12_RESOURCE_DESC{};
+        // A record for each eye, rate-limited together; this is candidate area,
+        // never a measured saving or proof of Unreal's visibility behavior.
+        static auto last_log = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_log >= std::chrono::seconds(2)) {
+            last_log = now;
+            spdlog::info("[Frame Perf] submit frame={} pose={} prepared={} matched={} projections={} rects={} scene={}x{} output={}x{} native_fix={} sceneview={} splitscreen={}",
+                state.frame_count, state.pose_frame_count, probe.prepared, use_probe, probe.projection_mask, probe.rect_mask,
+                source_desc.Width, source_desc.Height, desc.Width, desc.Height,
+                vr->is_native_stereo_fix_enabled(), vr->is_sceneview_compatibility_enabled(), vr->is_splitscreen_compatibility_enabled());
+            spdlog::info("[Frame Perf] geometry frame={} center={},{},{} size={},{} boundsL={},{},{},{} boundsR={},{},{},{}",
+                state.frame_count, layout.pose[3].x, layout.pose[3].y, layout.pose[3].z, layout.size.x, layout.size.y,
+                probe.bounds[0].x, probe.bounds[0].y, probe.bounds[0].z, probe.bounds[0].w,
+                probe.bounds[1].x, probe.bounds[1].y, probe.bounds[1].z, probe.bounds[1].w);
+            for (uint32_t eye = 0; eye < 2; ++eye) {
+                const auto& crop = probe.crops[eye];
+                const auto& rect = probe.scene_rects[eye];
+                const auto& p = probe.projections[eye];
+                const auto area = probe.width > 0 && probe.height > 0
+                    ? 100.0 * crop.rect.width * crop.rect.height / ((double)probe.width * probe.height) : 100.0;
+                spdlog::info("[Frame Perf] candidate frame={} eye={} crop={},{},{},{} area_pct={:.2f} fallback={} view={},{},{},{} P=[{},{},{},{};{},{},{},{};{},{},{},{};{},{},{},{}]",
+                    state.frame_count, eye, crop.rect.x, crop.rect.y, crop.rect.width, crop.rect.height, area, (int)crop.fallback,
+                    rect.x, rect.y, rect.width, rect.height,
+                    p[0][0], p[0][1], p[0][2], p[0][3], p[1][0], p[1][1], p[1][2], p[1][3],
+                    p[2][0], p[2][1], p[2][2], p[2][3], p[3][0], p[3][1], p[3][2], p[3][3]);
+            }
+        }
+    }
 
     const auto stage_to_frame = glm::inverse(frame_pose);
 
@@ -183,7 +228,9 @@ void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12
     for (uint32_t i = 0; i < 2; ++i) {
         const auto eye_to_frame = stage_to_frame * eyes[i];
         const auto& fov = state.stage_views[i].fov;
-        const auto& bounds = vr->m_openxr->view_bounds[i];
+        const auto bounds = use_probe ? probe.bounds[i] : glm::vec4{
+            vr->m_openxr->view_bounds[i][0], vr->m_openxr->view_bounds[i][1],
+            vr->m_openxr->view_bounds[i][2], vr->m_openxr->view_bounds[i][3]};
         const int eye_width = (int)desc.Width / 2;
         // Match the integer sub-image rectangle in OpenXR::end_frame exactly.
         const int x = i * eye_width + (int)(bounds[0] * eye_width);
@@ -214,8 +261,7 @@ void D3D12Component::draw_volumetric_frame(d3d12::TextureContext& target, ID3D12
 
 vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     if (!vr->is_volumetric_frame_enabled()) {
-        m_frame_was_enabled = false;
-        m_frame_was_ui_matched = false;
+        reset_volumetric_frame_anchor();
         vr->m_volumetric_frame_layout.active = false;
     }
 
@@ -1305,8 +1351,7 @@ void D3D12Component::on_reset(VR* vr) {
     m_frame_pipeline.Reset();
     m_frame_root.Reset();
     m_frame_mask_failed = false;
-    m_frame_was_enabled = false;
-    m_frame_was_ui_matched = false;
+    reset_volumetric_frame_anchor();
     m_prev_backbuffer.Reset();
     m_openvr.texture_counter = 0;
 }
@@ -1982,7 +2027,7 @@ void D3D12Component::OpenXR::copy(
             }
 
             if (swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE) {
-                vr->d3d12().draw_volumetric_frame(*texture_ctx, ctx.textures[texture_index].texture);
+                vr->d3d12().draw_volumetric_frame(*texture_ctx, ctx.textures[texture_index].texture, resource);
             }
 
             texture_ctx->commands.execute();
