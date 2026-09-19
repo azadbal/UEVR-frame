@@ -18,6 +18,7 @@
 #include "utility/Thread.hpp"
 #include "utility/String.hpp"
 #include "utility/Input.hpp"
+#include "utility/SessionLog.hpp"
 
 #include "WindowFilter.hpp"
 
@@ -34,6 +35,17 @@
 
 namespace fs = std::filesystem;
 using namespace std::literals;
+
+namespace {
+std::shared_ptr<spdlog::logger> create_session_logger() {
+    const auto target = utility::session_log_target(Framework::get_persistent_dir());
+    auto logger = spdlog::basic_logger_mt("UnrealVR", target.path.string(), target.truncate);
+    if (target.archive_failed) {
+        logger->warn("Failed to archive the previous log.txt ({}); appending to it", target.archive_error);
+    }
+    return logger;
+}
+}
 
 std::unique_ptr<Framework> g_framework{};
 
@@ -188,7 +200,7 @@ void Framework::command_thread() {
 Framework::Framework(HMODULE framework_module)
     : m_framework_module{framework_module}
     , m_game_module{GetModuleHandle(0)},
-    m_logger{spdlog::basic_logger_mt("UnrealVR", (get_persistent_dir() / "log.txt").string(), true)},
+    m_logger{create_session_logger()},
     m_vr{std::make_shared<VR>()}
 {
     std::scoped_lock __{m_constructor_mutex};
