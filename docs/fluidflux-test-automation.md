@@ -37,7 +37,16 @@ This is an automation/runtime smoke test, **not** a stereo-image acceptance test
 GPU benchmark, or proof of correct frame-to-pose association. Those results are
 explicitly separate in summary.json. The frame log is emitted before xrEndFrame;
 it is evidence of submission-path activity, not a GPU presentation completion
-counter. Per-eye image capture and scoped GPU timing remain future work.
+counter. Per-eye image capture remains future work.
+
+Prototype08 adds optional `-RequireTiming` (at least 100 valid GPU timestamp
+samples, no invalid/unavailable images) and `-RequireMatched` (at least three
+matched both-eye geometry samples). These checks need the prototype08 backend;
+default prototype07 smoke behavior remains available. See
+[the prototype08 notes](volumetric-frame-prototype-08.md) for the package-specific
+command and results. GPU timestamps cover UEVR copy/mask work, not Unreal's
+whole scene. `summary.json` records matched counts, scoped GPU sample counts,
+and explicitly marks image correctness and whole-game measurement unverified.
 
 ## First live findings, September 18, 2026
 
@@ -63,12 +72,10 @@ not automatically attributed to cropping, which stays off.
 
 ## Next automated experiment
 
-Keep this runner as the launch/cleanup layer. Add bounded diagnostics for the
-fix's two source targets, actual eye rectangles, and pose/render/probe identity.
-Run and inspect those automatically in FluidFlux. Measure CPU scope duration and
-GPU work separately: timers around UEVR copies/resolve measure that work only,
-not all Unreal rendering, runtime pacing, or Virtual Desktop encoding. Whole-game
-profiling still needs an appropriate measurement source.
+Keep this runner as the launch/cleanup layer. Prototype08 established the
+frame-association diagnosis and scoped CPU/GPU measurements. Those timings
+exclude Unreal rendering, runtime pacing, and Virtual Desktop encoding.
+Whole-game profiling still needs an appropriate measurement source.
 
 Then implement compatibility and run warmed, fixed-scene baseline/experiment/
 baseline comparisons with settings and applied states captured automatically.

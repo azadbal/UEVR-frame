@@ -247,11 +247,34 @@ private:
 
         XrGraphicsBindingD3D12KHR binding{XR_TYPE_GRAPHICS_BINDING_D3D12_KHR};
 
+        struct TimingStat {
+            uint32_t count{0};
+            double sum{0}, maximum{0};
+            void add(double ms) { ++count; sum += ms; if (ms > maximum) maximum = ms; }
+            double average() const { return count ? sum / count : 0; }
+        };
+
+        struct SubmissionTiming {
+            ComPtr<ID3D12QueryHeap> queries{};
+            ComPtr<ID3D12Resource> readback{};
+            ComPtr<ID3D12Fence> fence{};
+            uint64_t fence_value{0}, frequency{0};
+            bool unavailable{false}, mask_enabled{false};
+            bool begin(d3d12::CommandContext& commands);
+        };
+
         struct SwapchainContext {
+            // One query/readback set per output image, protected by its submission fence.
+            // Declared first so command contexts are destroyed before timing resources.
+            std::vector<SubmissionTiming> timings{};
             std::vector<XrSwapchainImageD3D12KHR> textures{};
             std::vector<std::unique_ptr<d3d12::TextureContext>> texture_contexts{};
             // Used only by DOUBLE_WIDE. Each scratch shares its output's command fence.
             std::vector<std::unique_ptr<d3d12::TextureContext>> frame_scratch{};
+            TimingStat gpu_copy{}, gpu_mask{}, cpu_fence_wait{}, cpu_record_execute{};
+            uint32_t timing_pending{0}, timing_invalid{0};
+            bool timing_enabled{false}, timing_mask_enabled{false};
+            std::chrono::steady_clock::time_point timing_report{};
             uint32_t num_textures_acquired{0};
             uint32_t last_acquired_texture{0};
             bool ever_acquired{false};

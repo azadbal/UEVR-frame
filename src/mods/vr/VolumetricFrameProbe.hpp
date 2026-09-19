@@ -56,6 +56,25 @@ struct VolumetricFrameProbe {
     uint32_t reduced_mask{0}; // Only eyes whose returned active view was reduced.
     uint32_t crop_decision_mask{0};
 
+    // Recorded only when Native Stereo Fix clones a known source queue entry.
+    // Submission must validate the retained source generation before matches can use it.
+    struct NativeClone {
+        uint32_t render_frame{0};
+        uint64_t source_pose_generation{0};
+        bool recorded{false};
+        bool validated{false};
+    } native_clone{};
+
+    bool record_native_clone(uint32_t source_frame, uint64_t source_generation, uint32_t render_frame,
+        bool source_pose_valid, bool source_crop_lost) {
+        const bool eligible = !native_clone.recorded && prepared && !has_modified_view() &&
+            source_pose_valid && !source_crop_lost && projection_mask == 3 && rect_mask == 3 &&
+            pose_frame == source_frame && render_frame == source_frame + 1;
+        native_clone = {};
+        if (eligible) native_clone = {render_frame, source_generation, true, false};
+        return eligible;
+    }
+
     bool has_modified_view() const { return (cropped_mask | reduced_mask) != 0; }
 
     bool valid_crop(uint32_t eye) const {
@@ -114,7 +133,9 @@ struct VolumetricFrameProbe {
     }
 
     bool matches(uint32_t frame, int output_width, int output_height) const {
-        return prepared && layout.active && pose_frame == frame &&
+        const bool frame_matches = native_clone.recorded ?
+            native_clone.validated && !has_modified_view() && native_clone.render_frame == frame : pose_frame == frame;
+        return prepared && layout.active && frame_matches &&
             width == output_width && height == output_height;
     }
 };
@@ -160,7 +181,13 @@ inline bool validate_frame_crop_submission(VolumetricFrameProbe& probe, bool& lo
     uint32_t pose_frame, uint64_t pose_generation, bool ever_modified) {
     diagnostic.render_frame_associated = associated;
     diagnostic.requested_render_frame = render_frame;
-    if (!associated || render_frame != pose_frame) {
+    probe.native_clone.validated = false;
+    const bool known_native_clone = probe.native_clone.recorded && !lost && probe.prepared &&
+        !probe.has_modified_view() && probe.projection_mask == 3 && probe.rect_mask == 3 && probe.pose_frame == pose_frame &&
+        probe.native_clone.source_pose_generation == pose_generation &&
+        probe.native_clone.render_frame == render_frame && render_frame == pose_frame + 1;
+    const bool frame_matches = probe.native_clone.recorded ? known_native_clone : render_frame == pose_frame;
+    if (!associated || !frame_matches) {
         // Missing association can recur after this probe was already cleared.
         if (diagnostic.reason == VolumetricFrameCropLoss::NONE) {
             capture_frame_crop_source(diagnostic, probe, pose_frame, pose_generation);
@@ -171,6 +198,7 @@ inline bool validate_frame_crop_submission(VolumetricFrameProbe& probe, bool& lo
         probe = {};
         return false;
     }
+    probe.native_clone.validated = known_native_clone;
     if (!lost) {
         capture_frame_crop_source(diagnostic, probe, pose_frame, pose_generation);
         diagnostic.reason = VolumetricFrameCropLoss::NONE;

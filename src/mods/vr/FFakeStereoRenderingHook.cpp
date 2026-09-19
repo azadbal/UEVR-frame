@@ -3375,7 +3375,12 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
             const auto last_frame = (frame_count) % runtimes::OpenXR::QUEUE_SIZE;
             const auto now_frame = (frame_count + 1) % runtimes::OpenXR::QUEUE_SIZE;
             openxr->pipeline_states[now_frame] = openxr->pipeline_states[last_frame];
-            openxr->pipeline_states[now_frame].frame_count = now_frame;
+            auto& cloned = openxr->pipeline_states[now_frame];
+            cloned.frame_count = frame_count + 1;
+            // Preserve the source pose/probe identity; only this known clone can
+            // associate it with the next render frame, after submit validation.
+            cloned.frame_probe.record_native_clone(frame_count, cloned.pose_generation, cloned.frame_count,
+                cloned.stage_pose_valid, cloned.frame_crop_lost);
         } else {
             auto openvr = (runtimes::OpenVR*)runtime;
             std::unique_lock __{ openvr->pose_mtx };

@@ -2,7 +2,9 @@ param(
     [string]$Package = 'C:/Users/Azad/Documents/_apps/UEVR/volumetric-frame-prototype-07',
     [string]$Game = 'C:/Dev/VR/UEVR/Game-demos/FluidFlux_3_0_1_Demo_UE532/FluidFlux.exe',
     [string]$FrontendConfig = 'C:/Users/Azad/AppData/Local/praydog/UEVRInjector_Path_vq1ugn2tgm4nwnngygjohieq3baiky3c/1.0.0.0/user.config',
-    [ValidateRange(30, 180)][int]$TimeoutSeconds = 90
+    [ValidateRange(30, 180)][int]$TimeoutSeconds = 90,
+    [switch]$RequireTiming,
+    [switch]$RequireMatched
 )
 $ErrorActionPreference = 'Stop'
 function Read-LiveText([string]$Path) {
@@ -56,6 +58,7 @@ $injector = $null
 $passed = $false
 $failure = $null
 $matchedSamples = 0
+$gpuSamples = 0
 $started = Get-Date
 $stopwatch = [Diagnostics.Stopwatch]::StartNew()
 try {
@@ -90,11 +93,11 @@ try {
             if ($result -match '(?m)^state=failed') { throw $result }
             if ($result -match '(?m)^state=complete') {
                 $log = Read-LiveText $logPath
-                # Native Stereo Fix currently breaks crop-probe association in FluidFlux.
-                # Smoke success proves runtime/settings/submission activity, not crop geometry or image correctness.
+                # Runtime smoke and geometry association are separate checks.
                 $samples = @([regex]::Matches($log, '\[Frame Perf\] submit frame=(\d+)[^\r\n]*native_fix=true[^\r\n]*cropped=0 reduced=0'))
                 $matchedSamples = @($samples | Where-Object {$_.Value -match 'matched=true projections=3 rects=3'}).Count
                 if ($samples.Count -lt 3) { throw 'Insufficient baseline submission observations.' }
+                if ($RequireMatched -and $matchedSamples -lt 3) { throw "Insufficient matched stereo geometry samples: $matchedSamples" }
                 if ($result -notmatch '(?m)^view0=[1-9]\d*' -or $result -notmatch '(?m)^view1=[1-9]\d*') {
                     throw 'FluidFlux UE5 did not invoke both eye-view callbacks.'
                 }
@@ -103,6 +106,14 @@ try {
                 if ($last -le $first) { throw 'Rendered frame identifiers are not advancing.' }
                 if ($log -notmatch 'XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED 5|XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED 6') {
                     throw 'OpenXR never reported VISIBLE or FOCUSED.'
+                }
+                if ($RequireTiming) {
+                    $timingLines = @($log -split "`n" | Where-Object {$_ -match '\[Frame Timing\] scope=uevr_openxr_native_submission '})
+                    foreach ($line in $timingLines) {
+                        if ($line -match '\bgpu_n=(\d+)') { $gpuSamples += [int]$Matches[1] }
+                        if ($line -match '\b(invalid|gpu_unavailable_images)=[1-9]\d*') { throw "Invalid GPU timing: $line" }
+                    }
+                    if ($gpuSamples -lt 100) { throw "Insufficient valid GPU timestamp samples: $gpuSamples" }
                 }
                 $passed = $true
                 Write-Output "Runtime checks passed: settings readback, both eye callbacks, $($samples.Count) submissions ($first -> $last); matched crop probes=$matchedSamples. Cleaning up."
@@ -156,7 +167,8 @@ try {
         passed=$passed; failure=$failure; started=$started.ToString('o'); seconds=$stopwatch.Elapsed.TotalSeconds
         package=$Package; backend_sha256=(Get-FileHash (Join-Path $Package 'UEVRBackend.dll')).Hash
         config_restored=$configRestored; frontend_restored=$frontendRestored
-        matched_crop_probe_samples=$matchedSamples; image_correctness_verified=$false; performance_measured=$false
+        matched_crop_probe_samples=$matchedSamples; image_correctness_verified=$false
+        scoped_gpu_timing_samples=$gpuSamples; whole_game_performance_measured=$false
     } | ConvertTo-Json | Set-Content (Join-Path $runDir 'summary.json')
     Write-Output "Evidence saved: $runDir"
     Write-Output "Final result: passed=$passed; config_restored=$configRestored; frontend_restored=$frontendRestored"

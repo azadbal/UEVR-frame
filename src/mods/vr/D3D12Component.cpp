@@ -2174,6 +2174,43 @@ void D3D12Component::OpenXR::destroy_swapchains() {
     vr->m_openxr->swapchains.clear();
 }
 
+bool D3D12Component::OpenXR::SubmissionTiming::begin(d3d12::CommandContext& commands) {
+    if (unavailable || fence != nullptr || !commands.ready()) {
+        return false;
+    }
+    if (queries == nullptr) {
+        auto& hook = g_framework->get_d3d12_hook();
+        auto device = hook->get_device();
+        auto queue = hook->get_command_queue();
+        D3D12_QUERY_HEAP_DESC query_desc{};
+        query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        query_desc.Count = 3;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = sizeof(uint64_t) * 3;
+        buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+        buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(queue->GetTimestampFrequency(&frequency)) || frequency == 0 ||
+            FAILED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&queries))) ||
+            FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)))) {
+            unavailable = true;
+            queries.Reset();
+            readback.Reset();
+            spdlog::warn("[Frame Timing] D3D12 submission GPU timestamps unavailable for image; CPU diagnostics remain enabled");
+            return false;
+        }
+    }
+    commands.cmd_list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    // Reserve before execute: failed Close/Signal must never permit unsafe reuse.
+    fence = commands.fence;
+    fence_value = commands.fence_value + 1;
+    return true;
+}
+
 void D3D12Component::OpenXR::copy(
     uint32_t swapchain_idx, 
     ID3D12Resource* resource, 
@@ -2213,6 +2250,16 @@ void D3D12Component::OpenXR::copy(
 
     const auto& swapchain = vr->m_openxr->swapchains[swapchain_idx];
     auto& ctx = this->contexts[swapchain_idx];
+    const bool double_wide = swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE;
+    const bool timing_enabled = double_wide && vr->m_volumetric_frame_diagnostics->value() && vr->is_native_stereo_fix_enabled();
+    const bool mask_enabled = vr->is_volumetric_frame_enabled();
+    if (ctx.timing_enabled != timing_enabled || ctx.timing_mask_enabled != mask_enabled) {
+        ctx.gpu_copy = {}; ctx.gpu_mask = {}; ctx.cpu_fence_wait = {}; ctx.cpu_record_execute = {};
+        ctx.timing_pending = ctx.timing_invalid = 0;
+        ctx.timing_report = std::chrono::steady_clock::now();
+        ctx.timing_enabled = timing_enabled;
+        ctx.timing_mask_enabled = mask_enabled;
+    }
 
     XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
 
@@ -2246,9 +2293,13 @@ void D3D12Component::OpenXR::copy(
             spdlog::error("[VR] xrWaitSwapchainImage failed: {}", vr->m_openxr->get_result_string(result));
         } else {
             auto& texture_ctx = ctx.texture_contexts[texture_index];
+            const auto fence_wait_start = timing_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             texture_ctx->commands.wait(INFINITE);
+            if (timing_enabled) {
+                ctx.cpu_fence_wait.add(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fence_wait_start).count());
+                ctx.timings.resize(ctx.texture_contexts.size());
+            }
 
-            const bool double_wide = swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE;
             auto& component = vr->d3d12();
             if (double_wide) {
                 texture_ctx->texture = ctx.textures[texture_index].texture;
@@ -2300,6 +2351,42 @@ void D3D12Component::OpenXR::copy(
                 }
             }
 
+            SubmissionTiming* timing = texture_index < ctx.timings.size() ? &ctx.timings[texture_index] : nullptr;
+            if (timing != nullptr && timing->fence != nullptr) {
+                const auto completed = timing->fence->GetCompletedValue();
+                if (completed == UINT64_MAX) {
+                    // Device removed; timestamps cannot be interpreted.
+                    timing->unavailable = true;
+                    timing->fence.Reset();
+                    ++ctx.timing_invalid;
+                } else if (completed >= timing->fence_value) {
+                    if (timing_enabled && !timing->unavailable && timing->mask_enabled == mask_enabled) {
+                        uint64_t* ticks{};
+                        D3D12_RANGE range{0, sizeof(uint64_t) * 3};
+                        if (SUCCEEDED(timing->readback->Map(0, &range, reinterpret_cast<void**>(&ticks)))) {
+                            if (ticks[0] <= ticks[1] && ticks[1] <= ticks[2]) {
+                                ctx.gpu_copy.add(double(ticks[1] - ticks[0]) * 1000.0 / timing->frequency);
+                                ctx.gpu_mask.add(double(ticks[2] - ticks[1]) * 1000.0 / timing->frequency);
+                            } else {
+                                ++ctx.timing_invalid;
+                            }
+                            D3D12_RANGE written{0, 0};
+                            timing->readback->Unmap(0, &written);
+                        } else {
+                            timing->unavailable = true;
+                            ++ctx.timing_invalid;
+                            spdlog::warn("[Frame Timing] D3D12 timestamp readback unavailable for image; CPU diagnostics remain enabled");
+                        }
+                    }
+                    timing->fence.Reset();
+                } else if (timing_enabled) {
+                    ++ctx.timing_pending;
+                }
+            }
+            const bool gpu_timing = timing_enabled && timing->begin(texture_ctx->commands);
+            if (gpu_timing) timing->mask_enabled = mask_enabled;
+            const auto record_start = timing_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
             if (pre_commands) {
                 (*pre_commands)(texture_ctx->commands, ctx.textures[texture_index].texture);
             }
@@ -2335,11 +2422,37 @@ void D3D12Component::OpenXR::copy(
                 (*additional_commands)(texture_ctx->commands);
             }
 
+            if (gpu_timing) texture_ctx->commands.cmd_list->EndQuery(timing->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
             if (swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE) {
                 vr->d3d12().draw_volumetric_frame(*texture_ctx, ctx.textures[texture_index].texture, resource);
             }
+            if (gpu_timing) {
+                texture_ctx->commands.cmd_list->EndQuery(timing->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
+                texture_ctx->commands.cmd_list->ResolveQueryData(timing->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 3, timing->readback.Get(), 0);
+                texture_ctx->commands.has_commands = true;
+            }
 
             texture_ctx->commands.execute();
+            if (gpu_timing && texture_ctx->commands.fence_value != timing->fence_value) {
+                // The command list did not submit. Retain resources and stop sampling it.
+                timing->unavailable = true;
+                ++ctx.timing_invalid;
+            }
+            if (timing_enabled) {
+                const auto now = std::chrono::steady_clock::now();
+                ctx.cpu_record_execute.add(std::chrono::duration<double, std::milli>(now - record_start).count());
+                if (now - ctx.timing_report >= std::chrono::seconds(2)) {
+                    uint32_t unavailable_images{0};
+                    for (const auto& image_timing : ctx.timings) unavailable_images += image_timing.unavailable;
+                    spdlog::info("[Frame Timing] scope=uevr_openxr_native_submission unit_ms=1 mask_enabled={} gpu_n={} gpu_copy_avg={:.4f} gpu_copy_max={:.4f} gpu_mask_avg={:.4f} gpu_mask_max={:.4f} cpu_n={} cpu_image_fence_wait_avg={:.4f} cpu_image_fence_wait_max={:.4f} cpu_record_execute_avg={:.4f} cpu_record_execute_max={:.4f} pending_skips={} invalid={} gpu_unavailable_images={} excludes=unreal_scene_gpu,xr_runtime_pacing",
+                        (uint32_t)mask_enabled, ctx.gpu_copy.count, ctx.gpu_copy.average(), ctx.gpu_copy.maximum, ctx.gpu_mask.average(), ctx.gpu_mask.maximum,
+                        ctx.cpu_record_execute.count, ctx.cpu_fence_wait.average(), ctx.cpu_fence_wait.maximum,
+                        ctx.cpu_record_execute.average(), ctx.cpu_record_execute.maximum, ctx.timing_pending, ctx.timing_invalid, unavailable_images);
+                    ctx.gpu_copy = {}; ctx.gpu_mask = {}; ctx.cpu_fence_wait = {}; ctx.cpu_record_execute = {};
+                    ctx.timing_pending = ctx.timing_invalid = 0;
+                    ctx.timing_report = now;
+                }
+            }
 
             XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             auto result = xrReleaseSwapchainImage(swapchain.handle, &release_info);

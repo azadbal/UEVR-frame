@@ -210,6 +210,72 @@ void submission_recovery_test() {
         "Unmodified startup frame was unnecessarily marked crop-lost");
 }
 
+void native_clone_submission_test() {
+    VolumetricFrameProbe source{};
+    source.pose_frame = 2045;
+    source.prepared = source.layout.active = true;
+    source.width = 2688;
+    source.height = 2880;
+    source.rect_mask = source.projection_mask = 3;
+    source.scene_rects = {{{0, 0, 2688, 2880}, {0, 0, 2688, 2880}}};
+    auto cloned = source;
+    require(cloned.record_native_clone(2045, 330, 2046, true, false), "Known native clone was not recorded");
+    require(!cloned.matches(2046, 2688, 2880), "Unvalidated clone matched submission");
+    bool lost = false;
+    VolumetricFrameCropDiagnostic diagnostic{};
+    require(validate_frame_crop_submission(cloned, lost, diagnostic, true, 2046, 2045, 330, false),
+        "Known native clone lost its render/source association");
+    require(!lost && cloned.matches(2046, 2688, 2880) && cloned.pose_frame == 2045 &&
+        source.pose_frame == 2045 && !source.native_clone.recorded &&
+        diagnostic.requested_render_frame == 2046 && diagnostic.source_pose_frame == 2045 &&
+        diagnostic.source_probe_frame == 2045 && diagnostic.source_pose_generation == 330,
+        "Native clone relabeled source identity or lost matching geometry");
+    require(!cloned.can_crop(1), "Native clone enabled eye-local cropping");
+    require(!cloned.matches(2046, 2689, 2880), "Resized native clone matched");
+
+    auto reject = [&](VolumetricFrameProbe probe, uint32_t render, uint32_t pose, uint64_t generation, bool associated) {
+        bool rejected_lost = false;
+        VolumetricFrameCropDiagnostic rejected_diagnostic{};
+        require(!validate_frame_crop_submission(probe, rejected_lost, rejected_diagnostic,
+            associated, render, pose, generation, false) && !probe.prepared && !probe.native_clone.validated,
+            "Unproven native clone survived submission validation");
+    };
+    reject(source, 2046, 2045, 330, true); // One-frame mismatch alone is insufficient.
+    reject(cloned, 2052, 2045, 330, true); // Six-slot ring reuse must not match.
+    reject(cloned, 2046, 2045, 331, true); // Same source frame, replaced pose generation.
+    reject(cloned, 2046, 2039, 330, true); // Replaced source identity.
+    reject(cloned, 2046, 2045, 330, false);
+    auto modified = cloned;
+    modified.cropped_mask = 1;
+    reject(modified, 2046, 2045, 330, true);
+    modified = source;
+    modified.reduced_mask = 1;
+    require(!modified.record_native_clone(2045, 330, 2046, true, false), "Modified view acquired a native clone token");
+    auto invalid_source = source;
+    require(!invalid_source.record_native_clone(2039, 330, 2046, true, false), "Stale source acquired a native clone token");
+    for (bool valid_pose : {false, true}) {
+        auto invalid = source;
+        require(!invalid.record_native_clone(2045, 330, 2046, valid_pose, true), "Lost source acquired a native clone token");
+    }
+    invalid_source = source;
+    require(!invalid_source.record_native_clone(2045, 330, 2046, false, false), "Invalid pose acquired a native clone token");
+    for (bool incomplete_rects : {false, true}) {
+        auto partial = source;
+        (incomplete_rects ? partial.rect_mask : partial.projection_mask) = 1;
+        require(!partial.record_native_clone(2045, 330, 2046, true, false), "Partial source acquired a native clone token");
+        partial = cloned;
+        (incomplete_rects ? partial.rect_mask : partial.projection_mask) = 1;
+        reject(partial, 2046, 2045, 330, true);
+    }
+
+    for (bool same_frame : {false, true}) {
+        auto replaced = cloned;
+        replace_frame_crop_pose(replaced, same_frame, lost, diagnostic, 2045, 330);
+        require(!replaced.native_clone.recorded && !replaced.native_clone.validated &&
+            !replaced.matches(2046, 2688, 2880), "Pose replacement retained a native clone token");
+    }
+}
+
 int main() try {
     const int width = 2053, height = 1999;
     const VolumetricFramePixelRect submitted{103, 81, 1843, 1796};
@@ -302,7 +368,8 @@ int main() try {
     projection_test<double>();
     view_transition_test();
     submission_recovery_test();
-    std::puts("PASS: crop geometry, view decisions, fail-closed submission reasons, source identity and fresh-frame recovery");
+    native_clone_submission_test();
+    std::puts("PASS: crop geometry, view decisions, fail-closed submission, source identity, native clone validation and recovery");
     return 0;
 } catch (const std::exception& e) {
     std::printf("FAIL: %s\n", e.what());
