@@ -69,7 +69,7 @@ def pacing_summary(log, phase, fixed_scale):
                   "slow_n includes unlogged slow calls. Different settings epochs remain separate."}
     expected = {"frame_enabled": "1", "crop_setting": str(int(phase["mode"] != "baseline")),
                 "reduce_setting": str(int(phase["mode"] in ("fixed", "reduced"))),
-                "native_fix": "0", "capture": "0", "afr": "0", "settings": "requested"}
+                "native_fix": str(int(phase.get("native_stereo_fix", False))), "capture": "0", "afr": "0", "settings": "requested"}
     scale = fixed_scale if phase["mode"] == "fixed" else 0
     groups = {}
     start, end = phase["measure_start_epoch"], phase["end_epoch"]
@@ -121,6 +121,7 @@ def report_run(directory, refresh_hz, control="baseline"):
     run = json.loads((directory / "summary.json").read_text(encoding="utf-8-sig"))
     evidence = json.loads((directory / "analysis.json").read_text(encoding="utf-8-sig"))
     result = {"archive": str(directory.resolve()), "game": run["game"], "backend_sha256": run["backend_sha256"],
+              "native_stereo_fix": bool(run.get("native_stereo_fix", False)),
               "resolution_scale": run["scale"], "fixed_scale": run["fixed_scale"], "refresh_hz_assumed": refresh_hz,
               "run_passed": run["passed"], "run_failure": run.get("failure"), "evidence_passed": evidence["passed"],
               "evidence_errors": evidence.get("errors", []), "control": control,
@@ -150,7 +151,8 @@ def report_run(directory, refresh_hz, control="baseline"):
         if not samples or end <= start or len(samples) != int(data["samples"]) or any(not math.isfinite(x) or x <= 0 for x in samples):
             raise ValueError(f"Malformed samples/duration for {stem.name}")
         stutters = sum(value > 2 / refresh_hz for value in samples)
-        phase = {"segment": index, "mode": mode, "measure_start_epoch": start, "end_epoch": end,
+        phase = {"segment": index, "mode": mode, "native_stereo_fix": bool(run.get("native_stereo_fix", False)),
+                 "measure_start_epoch": start, "end_epoch": end,
                  "wall_duration_seconds": end - start, "engine_delta_sum_seconds": sum(samples), "samples": len(samples),
                  "ticks_per_wall_second": len(samples) / (end - start), "mean_ms": sum(samples) / len(samples) * 1000,
                  "median_ms": percentile(samples, .5) * 1000, "p95_ms": percentile(samples, .95) * 1000,
@@ -166,7 +168,7 @@ def report_run(directory, refresh_hz, control="baseline"):
 
 def markdown(report):
     lines = [f"Archive: {report['archive']}",
-             f"Run passed: {report['run_passed']}; evidence passed: {report['evidence_passed']}; control: {report['control']}; assumed refresh: {report['refresh_hz_assumed']:g} Hz.",
+             f"Run passed: {report['run_passed']}; evidence passed: {report['evidence_passed']}; native stereo fix: {report['native_stereo_fix']}; control: {report['control']}; assumed refresh: {report['refresh_hz_assumed']:g} Hz.",
              "", "| Phase | Mode | Seconds / samples | Median ms | p95 ms | >2 intervals | Same-session outcome |",
              "|---|---|---:|---:|---:|---:|---|"]
     for row in report["phases"]:

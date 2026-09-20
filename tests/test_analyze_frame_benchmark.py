@@ -166,6 +166,58 @@ class BenchmarkEvidenceTests(unittest.TestCase):
         path.write_text(events.replace(f"epoch={epoch} capture_finished", f"epoch={epoch+15} capture_finished"))
         self.assertIn("capture window overlaps measurement", " ".join(analyze(self.path)["errors"]))
 
+    def _native_fixture(self):
+        run_path = self.path / "summary.json"
+        run = json.loads(run_path.read_text())
+        run["segments"] = ["baseline", "crop"]
+        run["native_stereo_fix"] = True
+        run_path.write_text(json.dumps(run))
+        for segment, mode in ((1, "baseline"), (2, "crop")):
+            path = self.path / f"codex-frame-benchmark-{segment:02d}-{mode}.txt"
+            path.write_text(path.read_text() + "native_stereo_fix=true\n")
+        for segment, mode in enumerate(("reduced", "fixed", "crop", "native_scaled"), 3):
+            for suffix in (".txt", ".csv"):
+                (self.path / f"codex-frame-benchmark-{segment:02d}-{mode}{suffix}").unlink()
+        self.lines = [line.replace("native_fix=false", "native_fix=true").replace("native_fix=0", "native_fix=1")
+                      .replace("view=100,0,", "view=0,0,") for line in self.lines]
+        events = self.path.joinpath("codex-frame-benchmark-events.txt").read_text()
+        events = "\n".join(line + " native_stereo_fix=true" if "state=warming" in line and "segment=" in line else line
+                              for line in events.splitlines())
+        self.path.joinpath("codex-frame-benchmark-events.txt").write_text(events)
+        self.save_log()
+
+    def test_native_fix_rejects_reduced_fixed_and_native_scaled(self):
+        path = self.path / "summary.json"
+        run = json.loads(path.read_text())
+        run["native_stereo_fix"] = True
+        path.write_text(json.dumps(run))
+        result = analyze(self.path)
+        self.assertFalse(result["passed"])
+        self.assertIn("only baseline and crop", " ".join(result["errors"]))
+
+    def test_native_fix_baseline_and_crop_are_accepted(self):
+        self._native_fixture()
+        result = analyze(self.path)
+        self.assertTrue(result["passed"], result["errors"])
+
+    def test_native_fix_rejects_off_state_and_timing_evidence(self):
+        self._native_fixture()
+        self.lines = [line.replace("native_fix=true", "native_fix=false").replace("native_fix=1", "native_fix=0")
+                      for line in self.lines]
+        self.save_log()
+        result = analyze(self.path)
+        self.assertFalse(result["passed"])
+        self.assertIn("submission mode/association/dimensions mismatch", " ".join(result["errors"]))
+        self.assertIn("incompatible mode/source state", " ".join(result["errors"]))
+
+    def test_native_fix_rejects_unknown_scene_dimensions(self):
+        self._native_fixture()
+        self.lines = [line.replace("scene=200x100 output=200x100", "scene=0x0 output=200x100") for line in self.lines]
+        self.save_log()
+        result = analyze(self.path)
+        self.assertFalse(result["passed"])
+        self.assertIn("submission mode/association/dimensions mismatch", " ".join(result["errors"]))
+
 
 if __name__ == "__main__":
     unittest.main()

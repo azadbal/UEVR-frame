@@ -153,6 +153,8 @@ bool D3D12Component::resolve_volumetric_frame(d3d12::TextureContext& target, d3d
     const auto desc = target.texture->GetDesc();
     const auto source_desc = source != nullptr ? source->GetDesc() : D3D12_RESOURCE_DESC{};
     bool snapshot_valid = (probe.reduced_mask & ~probe.cropped_mask) == 0 &&
+        probe.separate_eye_sources == (source == target.texture.Get()) &&
+        (!probe.separate_eye_sources || probe.reduced_mask == 0) &&
         probe.rect_mask == 3 && probe.projection_mask == 3 &&
         probe.matches(state.frame_count, (int)desc.Width / 2, (int)desc.Height) &&
         state.stage_views.size() == 2;
@@ -187,6 +189,13 @@ bool D3D12Component::resolve_volumetric_frame(d3d12::TextureContext& target, d3d
     const float background[]{0, probe.green ? 1.0f : 0.0f, 0, 1};
     auto list = target.commands.cmd_list.Get();
     const auto rtv = target.get_rtv();
+    // Native Stereo Fix has just assembled the two eye-local sources into this
+    // target. Preserve that image before clearing it for the cropped resolve.
+    if (result == VolumetricFrameResolveResult::RESOLVED) {
+        if (queries != nullptr) list->EndQuery(queries, D3D12_QUERY_TYPE_TIMESTAMP, 2);
+        target.commands.copy(source, scratch->texture.Get(), source_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        if (queries != nullptr) list->EndQuery(queries, D3D12_QUERY_TYPE_TIMESTAMP, 3);
+    }
     list->ClearRenderTargetView(rtv, background, 0, nullptr);
     target.commands.has_commands = true;
     if (result != VolumetricFrameResolveResult::RESOLVED) {
@@ -209,9 +218,6 @@ bool D3D12Component::resolve_volumetric_frame(d3d12::TextureContext& target, d3d
         report_frame_crop(result, 0, 0, reason, state.frame_count);
         return true;
     }
-    if (queries != nullptr) list->EndQuery(queries, D3D12_QUERY_TYPE_TIMESTAMP, 2);
-    target.commands.copy(source, scratch->texture.Get(), source_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    if (queries != nullptr) list->EndQuery(queries, D3D12_QUERY_TYPE_TIMESTAMP, 3);
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     list->SetGraphicsRootSignature(m_frame_resolve_root.Get());
     list->SetPipelineState(m_frame_resolve_pipeline.Get());
@@ -223,7 +229,7 @@ bool D3D12Component::resolve_volumetric_frame(d3d12::TextureContext& target, d3d
         const auto crop = (probe.cropped_mask & (1u << eye)) != 0
             ? probe.crops[eye].rect : VolumetricFramePixelRect{0, 0, probe.width, probe.height};
         const auto source_rect = (probe.cropped_mask & (1u << eye)) != 0
-            ? probe.scene_rects[eye] : VolumetricFramePixelRect{(int)eye * probe.width, 0, probe.width, probe.height};
+            ? probe.packed_scene_rect(eye) : VolumetricFramePixelRect{(int)eye * probe.width, 0, probe.width, probe.height};
         const int x = (int)eye * probe.width + crop.x;
         const std::array<glm::vec4, 2> constants{
             glm::vec4{(float)x, (float)crop.y, (float)crop.width, (float)crop.height},
@@ -1046,7 +1052,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 if (m_scene_capture_tex.texture.Get() == nullptr) {
                     m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, backbuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
                 } else {
-                    m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, nullptr, pre_render, std::nullopt, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
+                    m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, nullptr, pre_render, std::nullopt, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, true);
                 }
 
                 if (scene_depth_tex != nullptr) {
@@ -2377,7 +2383,8 @@ void D3D12Component::OpenXR::copy(
     std::optional<std::function<void(d3d12::CommandContext&, ID3D12Resource*)>> pre_commands, 
     std::optional<std::function<void(d3d12::CommandContext&)>> additional_commands, 
     D3D12_RESOURCE_STATES src_state, 
-    D3D12_BOX* src_box) 
+    D3D12_BOX* src_box,
+    bool native_eye_assembly)
 {
     std::scoped_lock _{this->mtx};
 
@@ -2478,16 +2485,33 @@ void D3D12Component::OpenXR::copy(
             }
 
             auto& component = vr->d3d12();
+            const auto output_resource = ctx.textures[texture_index].texture;
+            const auto output_desc = output_resource->GetDesc();
+            auto valid_eye_source = [&](ID3D12Resource* eye_source) {
+                if (eye_source == nullptr) return false;
+                const auto desc = eye_source->GetDesc();
+                return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                    desc.Width >= output_desc.Width / 2 && desc.Height == output_desc.Height &&
+                    desc.SampleDesc.Count == 1 && desc.DepthOrArraySize == 1 && desc.MipLevels == 1 &&
+                    (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                        desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS);
+            };
+            const bool assembled_eyes = native_eye_assembly && double_wide && resource == nullptr &&
+                pre_commands && !additional_commands && src_box == nullptr &&
+                component.m_backbuffer_size[0] == output_desc.Width && component.m_backbuffer_size[1] == output_desc.Height &&
+                valid_eye_source(component.m_game_tex.texture.Get()) && valid_eye_source(component.m_scene_capture_tex.texture.Get());
+            const bool direct_resolve = src_box == nullptr && !pre_commands && !additional_commands;
+            auto resolve_source = assembled_eyes ? output_resource : resource;
             if (double_wide) {
                 texture_ctx->texture = ctx.textures[texture_index].texture;
                 // Prepare every image before allowing a projection hook to crop.
                 // Scratch is never resized/replaced while an output fence uses it.
                 if (vr->is_frame_crop_requested() && !component.m_frame_resolve_failed &&
-                    component.m_frame_crop_dimensions == 0 && resource != nullptr &&
-                    src_box == nullptr && !pre_commands && !additional_commands) {
+                    component.m_frame_crop_dimensions == 0 && resolve_source != nullptr &&
+                    (direct_resolve || assembled_eyes)) {
                     auto device = g_framework->get_d3d12_hook()->get_device();
                     const auto desc = texture_ctx->texture->GetDesc();
-                    const auto source_desc = resource->GetDesc();
+                    const auto source_desc = resolve_source->GetDesc();
                     bool ready = desc.SampleDesc.Count == 1 && desc.DepthOrArraySize == 1 && desc.MipLevels == 1 &&
                         source_desc.Width == desc.Width && source_desc.Height == desc.Height &&
                         source_desc.SampleDesc.Count == 1 && source_desc.DepthOrArraySize == 1 && source_desc.MipLevels == 1 &&
@@ -2584,7 +2608,7 @@ void D3D12Component::OpenXR::copy(
 
             const bool resolved = double_wide && component.resolve_volumetric_frame(*texture_ctx,
                 texture_index < ctx.frame_scratch.size() ? ctx.frame_scratch[texture_index].get() : nullptr,
-                resource, src_state, src_box == nullptr && !pre_commands && !additional_commands,
+                resolve_source, assembled_eyes ? D3D12_RESOURCE_STATE_RENDER_TARGET : src_state, direct_resolve || assembled_eyes,
                 gpu_timing ? timing->queries.Get() : nullptr, sample_enabled ? &sample : nullptr);
 
             // The resolve wrote its copy pair only when it copied into scratch.
@@ -2624,7 +2648,7 @@ void D3D12Component::OpenXR::copy(
 
             if (gpu_timing) texture_ctx->commands.cmd_list->EndQuery(timing->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 5);
             if (swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE) {
-                component.draw_volumetric_frame(*texture_ctx, ctx.textures[texture_index].texture, resource, sample_enabled ? &sample : nullptr);
+                component.draw_volumetric_frame(*texture_ctx, ctx.textures[texture_index].texture, resolve_source, sample_enabled ? &sample : nullptr);
             }
             sample.resolved = component.m_frame_submission_resolved;
             sample.suppressed = component.m_frame_submission_suppressed;

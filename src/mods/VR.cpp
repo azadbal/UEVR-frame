@@ -2434,7 +2434,11 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 spdlog::info("[Frame Perf] setting ProjectionCrop={}", m_volumetric_frame_crop->value());
             }
             if (m_volumetric_frame_crop->value()) {
-                ImGui::TextWrapped("Narrows the game views through the frame. Turn off Native Stereo Fix, SceneView and SplitScreen compatibility. Disable this option if the image looks wrong.");
+                ImGui::TextWrapped("Narrows the game views through the frame. Supports Native Stereo Fix. Turn off SceneView and SplitScreen compatibility. Disable this option if the image looks wrong.");
+                ImGui::TextWrapped("Projection crop keeps scene resolution unchanged and concentrates detail inside the frame, so it can look sharper. Performance gains depend on the game and are not guaranteed.");
+                if (is_native_stereo_fix_enabled()) {
+                    ImGui::TextWrapped("Native Stereo Fix supports projection crop only; Reduce Scene Pixels is not applied.");
+                }
                 if (m_volumetric_frame_reduce_pixels->draw("Reduce Scene Pixels (Experimental)")) {
                     spdlog::info("[Frame Perf] setting ReduceScenePixels={}", m_volumetric_frame_reduce_pixels->value());
                 }

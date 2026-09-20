@@ -74,6 +74,9 @@ local function read_mode_value(key)
 end
 
 local function set_and_verify_mode(mode)
+    local expected_native = config.native_stereo_fix and "true" or "false"
+    local actual_native = read_mode_value("VR_NativeStereoFix")
+    if actual_native ~= expected_native then return false, "native stereo fix readback mismatch" end
     local crop = mode == "crop" or mode == "reduced" or mode == "fixed" or mode == "native_scaled"
     local reduce = mode == "reduced" or mode == "fixed"
     local fixed = mode == "fixed" and (config.fixed_scale or 0.8) or 0
@@ -129,9 +132,9 @@ local function write_phase_result(state, reason)
     for i, delta in ipairs(phase_samples) do csv[#csv + 1] = string.format("%d,%.9f", i, delta) end
     fs.write(prefix() .. string.format("-%02d-",phase_index) .. tostring(phase_name) .. ".csv", table.concat(csv, "\n") .. "\n")
     local summary = string.format(
-        "state=%s\nphase=%s\nreason=%s\ntimestamp=%s\nticks=%d\nsamples=%d\nmedian_delta=%.9f\np95_delta=%.9f\nwidth=%d\nheight=%d\n",
+        "state=%s\nphase=%s\nreason=%s\ntimestamp=%s\nticks=%d\nsamples=%d\nmedian_delta=%.9f\np95_delta=%.9f\nwidth=%d\nheight=%d\nnative_stereo_fix=%s\n",
         state, tostring(phase_name), tostring(reason or ""), timestamp(), phase_tick_count, #phase_samples,
-        median, p95, vr.get_hmd_width(), vr.get_hmd_height())
+        median, p95, vr.get_hmd_width(), vr.get_hmd_height(), tostring(config.native_stereo_fix and true or false))
     summary = summary .. string.format("segment=%d\nmode=%s\nstart_epoch=%d\nwarmup_seconds=%d\nmeasure_start_epoch=%d\nend_epoch=%d\nworld=%s\npawn=%s\n",
         phase_index, tostring(phase_name), phase_started_at or 0, config.warmup_seconds or 10,
         (phase_started_at or 0) + (config.warmup_seconds or 10), os.time(), phase_world, phase_pawn)
@@ -168,7 +171,7 @@ local function begin_phase()
     last_status_second = -1
     phase_samples = {}
     phase_tick_count = 0
-    marker("segment=" .. phase_index .. " phase=" .. tostring(phase_name) .. " state=warming")
+    marker("segment=" .. phase_index .. " phase=" .. tostring(phase_name) .. " state=warming native_stereo_fix=" .. tostring(config.native_stereo_fix and true or false))
     status("warming")
 end
 

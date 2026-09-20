@@ -50,6 +50,7 @@ struct VolumetricFrameProbe {
     uint32_t rect_mask{0};
     bool crop_requested{false};
     bool reduce_pixels_requested{false};
+    bool separate_eye_sources{false}; // Native Stereo Fix renders both eyes at x=0 in different targets.
     float fixed_view_scale{0.0f}; // Diagnostic source size, captured once per pose; zero keeps exact crop sizing.
     bool reduce_pixels_blocked{false}; // No usable pose at the first view callback.
     bool green{false};
@@ -64,19 +65,30 @@ struct VolumetricFrameProbe {
         uint64_t source_pose_generation{0};
         bool recorded{false};
         bool validated{false};
+        uint32_t cropped_mask{0};
     } native_clone{};
 
     bool record_native_clone(uint32_t source_frame, uint64_t source_generation, uint32_t render_frame,
         bool source_pose_valid, bool source_crop_lost) {
-        const bool eligible = !native_clone.recorded && prepared && !has_modified_view() &&
+        const bool eligible = !native_clone.recorded && prepared && native_clone_view_valid() &&
             source_pose_valid && !source_crop_lost && projection_mask == 3 && rect_mask == 3 &&
             pose_frame == source_frame && render_frame == source_frame + 1;
         native_clone = {};
-        if (eligible) native_clone = {render_frame, source_generation, true, false};
+        if (eligible) native_clone = {render_frame, source_generation, true, false, cropped_mask};
         return eligible;
     }
 
     bool has_modified_view() const { return (cropped_mask | reduced_mask) != 0; }
+
+    bool native_clone_view_valid() const {
+        if (!has_modified_view()) return true;
+        if (!separate_eye_sources || reduced_mask != 0 || (cropped_mask & ~3u) != 0) return false;
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            if (!baseline_rect(eye, scene_rects[eye]) ||
+                ((cropped_mask & (1u << eye)) && !can_crop(eye))) return false;
+        }
+        return true;
+    }
 
     bool valid_crop(uint32_t eye) const {
         if (eye >= 2 || !prepared || !layout.active || !crop_requested || width <= 0 || height <= 0 ||
@@ -87,7 +99,16 @@ struct VolumetricFrameProbe {
     }
 
     bool baseline_rect(uint32_t eye, VolumetricFramePixelRect rect) const {
-        return eye < 2 && rect.x == (int)eye * width && rect.y == 0 && rect.width == width && rect.height == height;
+        return eye < 2 && rect.x == (separate_eye_sources ? 0 : (int)eye * width) &&
+            rect.y == 0 && rect.width == width && rect.height == height;
+    }
+
+    // Native source images are assembled into a double-wide texture before resolve.
+    VolumetricFramePixelRect packed_scene_rect(uint32_t eye) const {
+        if (eye >= 2) return {};
+        auto rect = scene_rects[eye];
+        if (separate_eye_sources) rect.x += (int)eye * width;
+        return rect;
     }
 
     VolumetricFramePixelRect reduced_view_rect(uint32_t eye) const {
@@ -110,7 +131,7 @@ struct VolumetricFrameProbe {
                 incoming.width != previous.width || incoming.height != previous.height)) lost = true;
         }
         auto actual = incoming;
-        if (!(rect_mask & bit) && !lost && !reduce_pixels_blocked && reduce_pixels_requested && valid_crop(eye) &&
+        if (!(rect_mask & bit) && !lost && !separate_eye_sources && !reduce_pixels_blocked && reduce_pixels_requested && valid_crop(eye) &&
             baseline_rect(eye, incoming) && (!(crop_decision_mask & bit) || (cropped_mask & bit))) {
             actual = reduced_view_rect(eye);
             if (actual.width != width || actual.height != height) reduced_mask |= bit;
@@ -144,7 +165,8 @@ struct VolumetricFrameProbe {
 
     bool matches(uint32_t frame, int output_width, int output_height) const {
         const bool frame_matches = native_clone.recorded ?
-            native_clone.validated && !has_modified_view() && native_clone.render_frame == frame : pose_frame == frame;
+            native_clone.validated && native_clone_view_valid() && native_clone.cropped_mask == cropped_mask &&
+                native_clone.render_frame == frame : pose_frame == frame;
         return prepared && layout.active && frame_matches &&
             width == output_width && height == output_height;
     }
@@ -193,7 +215,8 @@ inline bool validate_frame_crop_submission(VolumetricFrameProbe& probe, bool& lo
     diagnostic.requested_render_frame = render_frame;
     probe.native_clone.validated = false;
     const bool known_native_clone = probe.native_clone.recorded && !lost && probe.prepared &&
-        !probe.has_modified_view() && probe.projection_mask == 3 && probe.rect_mask == 3 && probe.pose_frame == pose_frame &&
+        probe.native_clone_view_valid() && probe.native_clone.cropped_mask == probe.cropped_mask &&
+        probe.projection_mask == 3 && probe.rect_mask == 3 && probe.pose_frame == pose_frame &&
         probe.native_clone.source_pose_generation == pose_generation &&
         probe.native_clone.render_frame == render_frame && render_frame == pose_frame + 1;
     const bool frame_matches = probe.native_clone.recorded ? known_native_clone : render_frame == pose_frame;

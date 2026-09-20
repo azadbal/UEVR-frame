@@ -83,6 +83,14 @@ class ComparisonTests(unittest.TestCase):
         result = pacing_summary([], {"mode": "fixed", "measure_start_epoch": 10, "end_epoch": 20}, .74)
         self.assertFalse(result["available"])
 
+    def test_native_flag_selects_native_reports_and_excludes_off_reports(self):
+        native = pacing_summary([self.pacing(native_fix="1", reduce_setting="0", fixed_scale="0")], {"mode": "crop", "native_stereo_fix": True,
+                                               "measure_start_epoch": 10, "end_epoch": 20}, .74)
+        self.assertTrue(native["available"])
+        off = pacing_summary([self.pacing(native_fix="0", reduce_setting="0", fixed_scale="0")], {"mode": "crop", "native_stereo_fix": True,
+                                         "measure_start_epoch": 10, "end_epoch": 20}, .74)
+        self.assertFalse(off["available"])
+
 
 if __name__ == "__main__":
     unittest.main()

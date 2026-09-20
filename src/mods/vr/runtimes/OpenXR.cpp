@@ -908,6 +908,7 @@ void OpenXR::prepare_frame_probe() {
     probe.pose_frame = frame;
     probe.width = (int)vr->get_hmd_width();
     probe.height = (int)vr->get_hmd_height();
+    probe.separate_eye_sources = vr->is_native_stereo_fix_enabled();
     if (vr->is_volumetric_frame_enabled()) {
         probe.layout = vr->d3d12().prepare_volumetric_frame(eyes);
     }

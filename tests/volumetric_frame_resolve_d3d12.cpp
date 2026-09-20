@@ -187,8 +187,30 @@ int main() try {
     const auto encode = [](double value) {
         return (int)std::round(255 * (value <= .0031308 ? value * 12.92 : 1.055 * std::pow(value, 1 / 2.4) - .055));
     };
-    for (int test = 0; test < 11; ++test) {
-        const bool green = test == 5;
+    // Native Stereo Fix supplies two independent eye-local textures. Populate
+    // them from the distinct-eye fixture, then exercise assembly -> scratch ->
+    // clear -> resolve, including the ordering needed when output is the source.
+    std::array<ComPtr<ID3D12Resource>, 2> native_eyes;
+    auto eye_desc = texture_desc;
+    eye_desc.Width = 256;
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    transition(source.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    for (int eye = 0; eye < 2; ++eye) {
+        check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &eye_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&native_eyes[eye])));
+        from = {}; to = {};
+        from.pResource = source.Get();
+        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        to.pResource = native_eyes[eye].Get();
+        to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        const D3D12_BOX box{(UINT)eye * 256, 0, 0, (UINT)(eye + 1) * 256, 256, 1};
+        list->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+        transition(native_eyes[eye].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    }
+    transition(source.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    for (int test = 0; test < 13; ++test) {
+        const bool native = test >= 11;
+        const bool green = test == 5 || test == 12;
         const bool fail_closed = test == 6;
         std::array<std::array<int,4>,2> rects{{{31,47,181,133},{281,61,199,173}}};
         if (test == 0 || test == 3) rects[0] = {0,0,256,256};
@@ -205,13 +227,28 @@ int main() try {
             }
         }
         const float background[]{0,green ? 1.0f : 0.0f,0,1};
-        list->ClearRenderTargetView(rtv, background, 0, nullptr);
+        if (!native) list->ClearRenderTargetView(rtv, background, 0, nullptr);
         if (!fail_closed) {
-            transition(source.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            auto* copy_source = native ? texture.Get() : source.Get();
+            if (native) {
+                transition(texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+                for (int eye = 0; eye < 2; ++eye) {
+                    from = {}; to = {};
+                    from.pResource = native_eyes[eye].Get();
+                    from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    to.pResource = texture.Get();
+                    to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    list->CopyTextureRegion(&to, eye * 256, 0, 0, &from, nullptr);
+                }
+                transition(texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            } else {
+                transition(source.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            }
             transition(scratch.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-            list->CopyResource(scratch.Get(), source.Get());
-            transition(source.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->CopyResource(scratch.Get(), copy_source);
+            transition(copy_source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
             transition(scratch.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            if (native) list->ClearRenderTargetView(rtv, background, 0, nullptr);
             list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
             list->SetGraphicsRootSignature(root.Get());
             list->SetPipelineState(pipeline.Get());

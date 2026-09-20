@@ -80,6 +80,9 @@ def analyze(directory, allow_no_gpu=False):
                   "Engine deltas may include engine smoothing/clamping; they are not GPU timings.",
                   "Sparse probes cannot verify every frame or image quality."]}
     run = json.loads((directory / "summary.json").read_text(encoding="utf-8-sig"))
+    native_stereo_fix = bool(run.get("native_stereo_fix", False))
+    if native_stereo_fix and any(mode not in ("baseline", "crop") for mode in run["segments"]):
+        result["errors"].append("Native Stereo Fix runs support only baseline and crop modes")
     log = []
     visibility = []
     for line in (directory / "log.txt").read_text(encoding="utf-8-sig", errors="replace").splitlines():
@@ -114,8 +117,11 @@ def analyze(directory, allow_no_gpu=False):
                 errors.append("incomplete measurement interval")
             if start < float(data["start_epoch"]) + float(data["warmup_seconds"]):
                 errors.append("measurement overlaps warmup")
-            if not re.search(rf"segment={index}\s+phase={mode}\s+state=warming", events):
+            native_event = rf"\s+native_stereo_fix={'true' if native_stereo_fix else 'false'}" if native_stereo_fix else r"(?:\s+native_stereo_fix=false)?"
+            if not re.search(rf"segment={index}\s+phase={mode}\s+state=warming{native_event}", events):
                 errors.append("missing phase start event")
+            if native_stereo_fix and data.get("native_stereo_fix") != "true":
+                errors.append("phase native stereo fix setting mismatch")
             with stem.with_suffix(".csv").open(encoding="utf-8-sig", newline="") as file:
                 deltas = [float(row["delta_seconds"]) for row in csv.DictReader(file)]
             if not deltas or any(not math.isfinite(value) or value <= 0 for value in deltas):
@@ -150,11 +156,12 @@ def analyze(directory, allow_no_gpu=False):
                     errors.append(f"capture evidence invalid: {error}")
             phase["full_eye_dimensions"] = [width, height]
             for item in submits:
-                if any(item.get(key) != value for key, value in {
+                fixed_fields = {
                     "prepared": "true", "matched": "true", "projections": "3", "rects": "3",
-                    "native_fix": "false", "sceneview": "false", "splitscreen": "false",
-                    "cropped": str(expected_cropped), "reduced": str(expected_reduced),
-                    "scene": dimensions, "output": dimensions}.items()):
+                    "native_fix": "true" if native_stereo_fix else "false", "sceneview": "false", "splitscreen": "false",
+                    "cropped": str(expected_cropped), "reduced": str(expected_reduced)}
+                if any(item.get(key) != value for key, value in {
+                    **fixed_fields, "scene": dimensions, "output": dimensions}.items()):
                     errors.append(f"submission mode/association/dimensions mismatch at frame {item.get('frame')}")
             if any("[Frame Perf] resolve rejected " in line or
                    ("[Frame Perf] state " in line and item.get("result") in ("failed", "suppressed"))
@@ -185,7 +192,8 @@ def analyze(directory, allow_no_gpu=False):
                         extent = rect[2:]
                     elif mode == "fixed":
                         extent = (math.ceil(width * float_scale), math.ceil(height * float_scale))
-                    if view != (eye * width, 0, *extent) or (crop and candidate.get("fallback") != "0"):
+                    expected_x = 0 if native_stereo_fix else eye * width
+                    if view != (expected_x, 0, *extent) or (crop and candidate.get("fallback") != "0"):
                         errors.append(f"active rectangle/fallback mismatch at frame {item['frame']} eye {eye}")
             phase["observed_active_rectangles"] = sorted(active)
             timing = []
@@ -201,7 +209,7 @@ def analyze(directory, allow_no_gpu=False):
                     continue
                 if not (min(frame_numbers) <= int(item["frame_first"]) <= int(item["frame_last"]) <= max(frame_numbers)):
                     continue
-                expected = {"scope": "uevr_openxr_submission", "native_fix": "0", "mask_enabled": "1",
+                expected = {"scope": "uevr_openxr_submission", "native_fix": "1" if native_stereo_fix else "0", "mask_enabled": "1",
                     "crop_setting": str(crop), "reduce_setting": str(reduce), "cropped": str(expected_cropped),
                     "reduced": str(expected_reduced), "lost": "0", "resolved": str(crop), "suppressed": "0", "mask_drawn": "3"}
                 if any(item.get(key) != value for key, value in expected.items()) or any(

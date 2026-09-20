@@ -4,6 +4,8 @@ param(
     [ValidateSet('FluidFlux','DeepRock')][string]$GamePreset = 'FluidFlux',
     [ValidateRange(1,3)][int]$ResolutionScale = 3,
     [ValidateSet(0,1,2)][int]$VirtualDesktopFixOverride = 0,
+    [switch]$NativeStereoFix,
+    [switch]$ShowEngineStats,
     [ValidateRange(1,120)][int]$WarmupSeconds = 10,
     [ValidateRange(1,120)][int]$MeasureSeconds = 20,
     [ValidateRange(0.1,1)][double]$FixedScale = 0.8,
@@ -64,6 +66,9 @@ $segments = @($ModeSequence -split ',' | ForEach-Object { $_.Trim().ToLowerInvar
 if (-not $segments.Count -or ($segments | Where-Object { $_ -notin @('baseline','crop','reduced','fixed','native_scaled') })) {
     throw 'Modes must be baseline, crop, reduced, fixed, or native_scaled.'
 }
+if ($NativeStereoFix -and ($segments | Where-Object { $_ -notin @('baseline','crop') })) {
+    throw 'NativeStereoFix supports only baseline and crop modes.'
+}
 $repo = Split-Path $PSScriptRoot -Parent
 $runDir = Join-Path $repo ('build/diagnostics/frame-benchmark-' + (Get-Date -Format 'yyyy-MM-dd-HHmmss-fff'))
 $profile = Join-Path $env:APPDATA "UnrealVRMod/$processName"
@@ -88,7 +93,7 @@ Copy-Item -LiteralPath $FrontendConfig -Destination (Join-Path $runDir 'frontend
 if (Test-Path -LiteralPath $logPath) { Copy-Item -LiteralPath $logPath -Destination (Join-Path $runDir 'log.before.txt') }
 $settings = [ordered]@{
     Frontend_RequestedRuntime = 'openxr_loader.dll'
-    VR_NativeStereoFix = 'false'
+    VR_NativeStereoFix = if ($NativeStereoFix) { 'true' } else { 'false' }
     OpenXR_ResolutionScale = $ResolutionScale.ToString('0.0',[Globalization.CultureInfo]::InvariantCulture)
     OpenXR_VirtualDesktopFixOverride = $VirtualDesktopFixOverride
     VR_VolumetricFrameFixedViewScale = '0'
@@ -106,6 +111,7 @@ if ($GamePreset -eq 'DeepRock') {
     # The original spectator preference is restored with the rest of the profile.
     $settings['VR_DesktopRecordingFix_V2'] = 'true'
 }
+if ($ShowEngineStats) { $settings['VR_ShowStatsOverlay'] = 'true' }
 $content = [IO.File]::ReadAllText($config)
 foreach ($entry in $settings.GetEnumerator()) {
     $pattern = '(?m)^' + [regex]::Escape($entry.Key) + '=[^\r\n]*'
@@ -138,7 +144,8 @@ try {
     $modeLua = ($segments | ForEach-Object { "'$_'" }) -join ','
     $scaleLua = $FixedScale.ToString('R',[Globalization.CultureInfo]::InvariantCulture)
     $captureLua = if ($CaptureFrames) { 'true' } else { 'false' }
-    $preamble = "local config = {modes={$modeLua}, warmup_seconds=$WarmupSeconds, measure_seconds=$MeasureSeconds, fixed_scale=$scaleLua, native_percentage=$NativePercentage, game='$GamePreset', capture_frames=$captureLua}"
+    $nativeLua = if ($NativeStereoFix) { 'true' } else { 'false' }
+    $preamble = "local config = {modes={$modeLua}, warmup_seconds=$WarmupSeconds, measure_seconds=$MeasureSeconds, fixed_scale=$scaleLua, native_percentage=$NativePercentage, native_stereo_fix=$nativeLua, game='$GamePreset', capture_frames=$captureLua}"
     $lua = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'frame_benchmark.lua'))
     if (-not $lua.Contains('-- BENCHMARK_CONFIGURATION')) { throw 'Missing Lua configuration marker.' }
     [IO.File]::WriteAllText($scriptPath,$lua.Replace('-- BENCHMARK_CONFIGURATION',$preamble))
@@ -248,7 +255,7 @@ try {
     $summary = [ordered]@{
         passed=$passed; failure=$failure; started=$started.ToString('o'); seconds=$stopwatch.Elapsed.TotalSeconds
         game=$Game; scale=$ResolutionScale; vd_fix=$VirtualDesktopFixOverride; segments=$segments
-        fixed_scale=$FixedScale; native_percentage=$NativePercentage; warmup_seconds=$WarmupSeconds; measure_seconds=$MeasureSeconds
+        fixed_scale=$FixedScale; native_percentage=$NativePercentage; native_stereo_fix=[bool]$NativeStereoFix; show_engine_stats=[bool]$ShowEngineStats; warmup_seconds=$WarmupSeconds; measure_seconds=$MeasureSeconds
         capture_frames=[bool]$CaptureFrames
         package=$Package; backend_sha256=$backendHash; processes_stopped=$processesStopped
         shutdown_crash_detected=$shutdownCrashDetected

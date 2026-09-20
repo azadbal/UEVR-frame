@@ -281,6 +281,60 @@ void submission_recovery_test() {
         "Unmodified startup frame was unnecessarily marked crop-lost");
 }
 
+void native_eye_crop_test() {
+    VolumetricFrameProbe probe{};
+    probe.pose_frame = 41;
+    probe.prepared = probe.layout.active = probe.crop_requested = true;
+    probe.separate_eye_sources = true;
+    probe.width = 2000;
+    probe.height = 1800;
+    probe.crops = {{{{100, 200, 900, 800}, VolumetricFrameCropFallback::NONE},
+                    {{80, 210, 880, 790}, VolumetricFrameCropFallback::NONE}}};
+    bool lost = false;
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        probe.record_view_rect(eye, {0, 0, 2000, 1800}, lost);
+        require(probe.apply_projection_crop(eye, lost), "Native eye-local view was not cropped");
+    }
+    require(probe.cropped_mask == 3 && !lost, "Native eyes did not retain independent crop decisions");
+    require(probe.packed_scene_rect(0).x == 0 && probe.packed_scene_rect(1).x == 2000,
+        "Native eye-local sources lost eye identity after assembly");
+    probe.projection_mask = 3;
+    require(probe.record_native_clone(41, 7, 42, true, false), "Native crop clone was rejected");
+    VolumetricFrameCropDiagnostic diagnostic{};
+    require(validate_frame_crop_submission(probe, lost, diagnostic, true, 42, 41, 7, true) &&
+        !lost && probe.matches(42, 2000, 1800), "Native crop clone lost source pose association");
+    auto corrupt = probe;
+    corrupt.cropped_mask = 1;
+    require(!validate_frame_crop_submission(corrupt, lost, diagnostic, true, 42, 41, 7, true) && lost,
+        "Changed native crop decisions survived clone validation");
+    corrupt = probe;
+    lost = false;
+    require(!validate_frame_crop_submission(corrupt, lost, diagnostic, true, 42, 41, 8, true) && lost,
+        "Changed native crop source generation survived validation");
+    corrupt = probe;
+    corrupt.native_clone = {};
+    corrupt.rect_mask = corrupt.cropped_mask = corrupt.crop_decision_mask = 0;
+    corrupt.reduce_pixels_requested = true;
+    lost = false;
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        const auto rect = corrupt.record_view_rect(eye, {0, 0, 2000, 1800}, lost);
+        require(rect.width == 2000 && rect.height == 1800 && corrupt.apply_projection_crop(eye, lost),
+            "Native pixel request changed full-size crop behavior");
+    }
+    require(corrupt.reduced_mask == 0, "Native crop enabled pixel reduction");
+    corrupt.reduced_mask = 1;
+    require(!corrupt.record_native_clone(41, 7, 42, true, false), "Reduced native view acquired a clone token");
+    corrupt = probe;
+    corrupt.scene_rects[1].x = 2000;
+    lost = false;
+    require(!validate_frame_crop_submission(corrupt, lost, diagnostic, true, 42, 41, 7, true) && lost,
+        "Packed rect was accepted for an eye-local native source");
+    corrupt = probe;
+    lost = false;
+    corrupt.record_view_rect(1, {0, 0, 1900, 1800}, lost);
+    require(lost, "Changed native eye rect after projection did not fail closed");
+}
+
 void native_clone_submission_test() {
     VolumetricFrameProbe source{};
     source.pose_frame = 2045;
@@ -440,6 +494,7 @@ int main() try {
     view_transition_test();
     fixed_view_diagnostic_test();
     submission_recovery_test();
+    native_eye_crop_test();
     native_clone_submission_test();
     std::puts("PASS: crop geometry, view decisions, fail-closed submission, source identity, native clone validation and recovery");
     return 0;
