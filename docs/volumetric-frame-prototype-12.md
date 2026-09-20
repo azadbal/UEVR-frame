@@ -1,5 +1,19 @@
 # Volumetric frame prototype 12
 
+## Manual FluidFlux acceptance — 2026-09-20
+
+The user reports that prototype 12 works well. The surviving 2026-09-19
+22:01:39–22:05:50 log/config were preserved in
+`build/diagnostics/prototype12-user-2026-09-20-092707`.
+Of 125 sampled submissions, one was an unmatched startup baseline and the next
+124 were matched both-eye crops with Native Stereo Fix ON and reduction OFF.
+Both source/output stayed 8192x3288. Two explicit missing-association rejections
+occurred during startup and recovered; a later full-view fallback lasted about
+0.223 seconds and recovered. No resource failure was recorded. The 21,806 scoped
+UEVR GPU samples are not a whole-game GPU measurement or controlled OFF/ON test.
+This records FluidFlux user acceptance, not Hogwarts or all SamePass variants.
+The earlier blocked automated attempt below remains historical.
+
 AZA-205: projection crop with Native Stereo Fix enabled. Pixel reduction remains
 in place and remains blocked with Native Stereo Fix. Its removal is deferred by
 the user's latest instruction. This is a compatibility candidate, not a measured

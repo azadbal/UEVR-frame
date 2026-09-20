@@ -13,8 +13,6 @@ local phase_tick_count = 0
 local phase_name = nil
 local finished = false
 local failure = nil
-local saved_screen_percentage = nil
-local screen_percentage_variable = nil
 local phase_world = ""
 local phase_pawn = ""
 local capture_done = false
@@ -77,7 +75,7 @@ local function set_and_verify_mode(mode)
     local expected_native = config.native_stereo_fix and "true" or "false"
     local actual_native = read_mode_value("VR_NativeStereoFix")
     if actual_native ~= expected_native then return false, "native stereo fix readback mismatch" end
-    local crop = mode == "crop" or mode == "reduced" or mode == "fixed" or mode == "native_scaled"
+    local crop = mode == "crop" or mode == "reduced" or mode == "fixed"
     local reduce = mode == "reduced" or mode == "fixed"
     local fixed = mode == "fixed" and (config.fixed_scale or 0.8) or 0
     vr.set_mod_value("VR_VolumetricFrameCrop", crop and "true" or "false")
@@ -89,32 +87,7 @@ local function set_and_verify_mode(mode)
     if actual_crop ~= (crop and "true" or "false") then return false, "crop readback mismatch" end
     if actual_reduce ~= (reduce and "true" or "false") then return false, "reduce readback mismatch" end
     if tonumber(actual_fixed) == nil or math.abs(tonumber(actual_fixed) - fixed) > 0.00001 then return false, "fixed view scale readback mismatch" end
-    if mode ~= "native_scaled" and screen_percentage_variable ~= nil then
-        screen_percentage_variable:set_float(saved_screen_percentage)
-        if math.abs(screen_percentage_variable:get_float() - saved_screen_percentage) > 0.01 then
-            return false, "screen percentage restore failed"
-        end
-    end
-    if mode == "native_scaled" then
-        if config.native_percentage == nil then return false, "native_scaled requires native_percentage" end
-        local variable = safe_call(function() return api:get_console_manager():find_variable("r.ScreenPercentage") end)
-        if variable == nil then return false, "r.ScreenPercentage is unavailable" end
-        if saved_screen_percentage == nil then
-            saved_screen_percentage = safe_call(function() return variable:get_float() end)
-            screen_percentage_variable = variable
-        end
-        if not safe_call(function() variable:set_float(config.native_percentage); return true end) then return false, "r.ScreenPercentage could not be set" end
-        local applied = safe_call(function() return variable:get_float() end)
-        if applied == nil or math.abs(applied - config.native_percentage) > 0.01 then return false, "r.ScreenPercentage readback mismatch" end
-        marker("r.ScreenPercentage=" .. tostring(applied) .. " effective_scene_resolution=unknown")
-    end
     return true, "applied"
-end
-
-local function restore_screen_percentage()
-    if screen_percentage_variable ~= nil and saved_screen_percentage ~= nil then
-        safe_call(function() screen_percentage_variable:set_float(saved_screen_percentage) end)
-    end
 end
 
 local function percentile(samples, fraction)
@@ -146,7 +119,6 @@ local function fail(reason)
     failure = reason
     marker("state=failed reason=" .. tostring(reason))
     if phase_name ~= nil then write_phase_result("failed", reason) end
-    restore_screen_percentage()
     status("failed", reason)
     finished = true
 end
@@ -154,7 +126,6 @@ end
 local function begin_phase()
     phase_name = config.modes[phase_index]
     if phase_name == nil then
-        restore_screen_percentage()
         status("complete", "phases=" .. tostring(phase_index-1))
         marker("state=complete")
         finished = true

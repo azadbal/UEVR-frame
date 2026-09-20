@@ -1,3 +1,4 @@
+# Historical prototype07 smoke helper; use run-frame-benchmark.ps1 for current validation.
 param(
     [string]$Package = 'C:/Users/Azad/Documents/_apps/UEVR/volumetric-frame-prototype-07',
     [string]$Game = 'C:/Dev/VR/UEVR/Game-demos/FluidFlux_3_0_1_Demo_UE532/FluidFlux.exe',

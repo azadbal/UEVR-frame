@@ -1,105 +1,94 @@
-# Volumetric Frame prototype 03
+# Volumetric Frame
 
-Status: user confirmed prototype 03 works in FluidFlux on 2026-09-18.
-Release x64 build, placement regression and nine D3D12 WARP mask cases passed.
-Performance optimization is not implemented or benchmarked yet.
+An anchored 16:9 portal into UEVR's stereo, six-degree-of-freedom game world.
+Automatic placement matches the game HUD; leaning changes the view through the
+opening. Desktop camera composition is not calibrated or reproduced exactly.
 
-This experimental mode preserves UEVR's native stereo/6DoF game view through an
-anchored 16:9 opening. It automatically aligns that opening with the captured game
-HUD. It does not change the game's camera FOV or warp the world.
+Prototype 12's projection crop with Native Stereo Fix ON was confirmed working
+well by the user in FluidFlux on 2026-09-20. Prototype 13 polishes controls and
+developer tooling; it does not change the renderer. Hogwarts validation of the
+new native-fix crop path is still pending.
 
-## Requirements and controls
+## Controls
 
-- D3D12, OpenXR and **Native Stereo**.
-- Disable **2D Screen Mode**, **Extreme Compatibility Mode**, and stereo emulation.
-- Open UEVR's menu with Insert, then **VR > Runtime > Volumetric Frame (Experimental)**.
-- Enable the frame and leave **Match Game UI (automatic)** on (the default).
-  On activation, or when changing it from false to true, placement uses the
-  normal UEVR stage-anchored UI screen pose from its standing origin, rotation
-  offset and decoupled-pitch settings. It does not recenter to the instantaneous
-  head pose. UI Size is height: the default 2 m height means about 3.56 m width
-  at 16:9.
-- **Move Game UI with Frame** is on by default. With it on, the game HUD shares
-  the frame's anchored rectangle; a cylinder HUD temporarily becomes flat.
-  With it off, the HUD keeps its normal pose, size, head-follow behavior and
-  cylinder mode while the portal moves independently; it may extend outside the
-  portal by design. Saved UI preferences are not overwritten.
-- If **UI Follows View** is enabled, there is no fixed normal screen. Automatic
-  matching therefore uses a stable stage UI placement so the portal does not
-  depend on the current head direction; it does not change the saved setting.
-- Turn automatic matching off to use the original manual width/distance controls.
-  The game HUD still shares that manually sized frame when **Move Game UI with
-  Frame** is enabled.
-- **Recenter Frame** is explicitly head-based: it moves the frame, and the HUD
-  when **Move Game UI with Frame** is enabled, in front of the current head.
-- **Green Surroundings (0, 255, 0)** selects opaque green; unchecked selects black.
-- Use UEVR's normal Save Config action to retain options. The spatial anchor is
-  recreated each activation/session rather than persisted across tracking spaces.
+Open **VR > Runtime > Volumetric Frame (Experimental)** in UEVR's injected menu.
+The feature requires D3D12, OpenXR and Native Stereo. Disable 2D Screen Mode,
+Extreme Compatibility Mode and stereo emulation. Native Stereo Fix can stay ON.
 
-UEVR's own settings panel is separate and remains usable. Unsupported rendering
-settings leave ordinary rendering active. Feature defaults off. Use a 16:9 game
-window for this first version: mapping an ultrawide HUD texture to the rectangle
-does not cause the game to relayout its UI.
+- **Enable Volumetric Frame:** enables the anchored opening. Defaults off.
+- **Match Game UI (automatic):** uses the normal stage-anchored UI position,
+  independently of where you are looking when you enable it. UI Size is height:
+  2 m means about 3.56 m wide at 16:9. Head-following UI preferences are preserved,
+  but the matching anchor stays fixed. Disable matching for manual width/distance.
+- **Move Game UI with Frame:** links the captured HUD to the portal. Disable it
+  to preserve the HUD's normal pose, size and head-follow behavior. Linked curved
+  HUDs become flat; saved UI preferences are not overwritten.
+- **Recenter Frame:** explicitly places the portal in front of your current head
+  position and direction. The linked HUD follows.
+- **Green Surroundings (0, 255, 0):** selects chroma-key green; otherwise black.
+- **Projection Crop (Experimental):** concentrates full-resolution scene rendering
+  into the portal. Requires SceneView and SplitScreen compatibility OFF.
 
-## FluidFlux headset acceptance
+Hover the `(?)` markers for explanation. Experimental rendering and diagnostics
+are in collapsed sections; collapsing them does not change saved settings. Use
+UEVR's normal Save Config action to retain preferences. The anchor is recreated
+each activation/session. Keep the game's window at 16:9: stretching an ultrawide
+HUD texture into this opening does not relayout the game's UI.
 
-User-confirmed working target with our preceding build:
-`C:/Dev/VR/UEVR/Game-demos/FluidFlux_3_0_1_Demo_UE532/FluidFlux.exe`.
-The injector process entry is `FluidFlux-Win64-Shipping`.
+## Sharpness and performance
 
-1. Close FluidFlux and other injectors; connect Virtual Desktop as usual.
-2. Launch FluidFlux, then inject with the separate prototype 03 package using
-   OpenXR. Keep Native Stereo and a 16:9 game window.
-3. Enable Volumetric Frame with automatic UI matching. Do not adjust frame width
-   or distance. Check the game HUD and frame boundaries share one rectangle.
-4. Turn your head, then toggle **Match Game UI** off and on. The frame (and linked
-   HUD) should return to the fixed normal UI anchor, rather than the head pose.
-5. Turn **Match Game UI** and **Move Game UI with Frame** off, then manually resize
-   or change distance.
-   The HUD pose, size, head-follow behavior and cylinder mode should remain
-   unchanged while the portal moves independently.
-6. Face a different direction and press **Recenter Frame**. This explicit action
-   should use the current head pose; with Move Game UI on, the HUD follows it.
-7. Test green surroundings with Virtual Desktop chroma-key passthrough, then
-   disable the frame and check normal game/UI behavior returns.
+Crop-only keeps full scene view dimensions while narrowing each eye's projection.
+More samples cover each visible detail, which can improve sharpness. Unreal may
+also skip objects outside that view, but pixel shading is not automatically
+cheaper and image reconstruction adds work. A speedup is not guaranteed.
 
-Record any eye mismatch, boundary jitter, HUD clipping or interaction problems.
-Automated shader checks do not replace this injected-game/headset acceptance.
+For more rendered detail, use **OpenXR Options > Resolution Scale**. It scales
+both dimensions: increasing 1.0 to 1.1 requests about 21% more pixels, before
+other engine/runtime resolution behavior. Check the displayed render dimensions
+and frame times. Extra samples do not create detail absent from game assets.
+An independent portal quality control would require separate source/output sizing;
+it is not implemented by this polish pass.
 
-## Scope and limitations
+**Reduce Scene Pixels** remains an opt-in experiment under Experimental Rendering.
+It reduces active scene view dimensions, trading some crop-only supersampling for
+less pixel work. Full texture allocations remain. It is blocked with Native Stereo
+Fix ON. **Fixed View Scale** is a diagnostic variant, not a quality preset: it
+changes horizontal/vertical sampling and may not match the live crop's quality.
 
-The D3D12 mask runs after scene rendering. This build does not reduce scene work;
-performance optimization is a separate experiment. It uses submitted eye poses,
-FOVs and integer crop rectangles, retaining game pixels inside the opening and
-writing opaque black/green outside. When linked, the game HUD quad consumes the
-same frame pose and dimensions. Crossing behind the one-sided plane hides the game.
+The reduction idea remains valid, but compatibility and net cost are unresolved.
+FluidFlux showed shorter engine intervals under high pixel load; Deep Rock showed
+regressions. Neither proves a single implementation bug or universal benefit.
+Future work should first freeze each eye's reference crop dimensions, compare
+equivalent sampling during controlled motion, then measure Unreal scene GPU time,
+temporal stability and total frame time. Native-fix pixel reduction is separate
+work. Keep historical evidence in prototypes 10/11; removal remains deferred.
 
-Captured HUD placement is aligned; UI drawn directly in the 3D scene is not moved
-by this change. Exact native desktop camera composition is not the goal. Optional
-reference FOV by physically changing width/distance is specified as priority two.
-Depth submission remains suppressed while the frame is active. Runtime late
-reprojection and reference-space changes still need headset validation.
-Multisampled swapchains are unsupported. Green game content may also be keyed out
-by Virtual Desktop.
+## Diagnostics and validation
 
-## Build and automated validation
+**Diagnostics > Performance Diagnostics** saves settings, applied paths, recovery
+and scoped UEVR GPU/CPU timings. It does not measure whole-game GPU time. Logging
+is opt-in and synchronous, so disable it for normal play. Per-game `log.txt` is
+archived into a unique `logs/` file at the next injection.
 
-Build Release x64 with the existing CMake setup. From a VS x64 developer prompt:
+**Show Engine Statistics** uses Unreal's `stat unit`; **Show FPS** uses `stat fps`.
+The automated runner can enable the overlay but does not export its numeric values.
 
-```bat
-cl /nologo /EHsc /std:c++17 /Idependencies/submodules/glm tests/volumetric_frame_anchor.cpp /Febuild/frame-anchor-test.exe /Fobuild/frame-anchor-test.obj
-build\frame-anchor-test.exe
-cl /nologo /EHsc /std:c++17 /Idependencies/submodules/glm tests/volumetric_frame_d3d12.cpp /Febuild/frame-test.exe /Fobuild/frame-test.obj /link d3d12.lib dxgi.lib
-build\frame-test.exe
-python tests/volumetric_frame_crop_math.py
-```
+Use `tests/run-frame-benchmark.ps1` for launch/injection, warmed comparisons,
+optional stereo captures, log archival and profile restoration. Native-fix runs
+accept baseline/crop only. The old prototype-07 smoke helper is historical.
+The unreliable `native_scaled` launch mode was retired; historical analysis stays
+readable. Run `python -m unittest discover -s tests -p "test_*frame*.py"` for the
+analysis regressions; native geometry and D3D12 test build commands are in their
+source headers. Keep these regressions and frame-association safeguards.
 
-The placement-policy regression failed on prototype02's rematch decision and
-passes after separating automatic matching from head-based recentering.
-The WARP test executes the actual mask shader and compares nine cases pixel by
-pixel, including shared HUD dimensions, offsets and rotated-frame geometry. The
-six crop-math tests specify a future optimization; they do not exercise engine
-culling or imply that optimization is present in this build.
+For headset checks, compare crop OFF/ON/OFF at a fixed viewpoint, then turn/lean,
+check both eyes, recenter, HUD alignment, green/black and loading recovery.
+Headset appearance, engine tick intervals and GPU timings are separate evidence.
+See [prototype 12](volumetric-frame-prototype-12.md) for native-fix implementation
+and the recorded manual test.
 
-See [the agreed spec](volumetric-frame-next-steps.md) and
-[performance experiment](volumetric-frame-performance-experiment.md).
+Depth submission stays disabled while the frame is active. Crossing behind the
+one-sided portal hides the game. Multisampled swapchains are unsupported. HUD
+drawn directly in the world is not repositioned; green game content can be keyed
+out by Virtual Desktop. Coupled portal/world resizing and reference-FOV controls
+remain deferred.

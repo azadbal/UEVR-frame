@@ -1,6 +1,6 @@
 param(
-    [string]$Package = 'C:/Users/Azad/Documents/_apps/UEVR/volumetric-frame-prototype-11',
-    [string]$FrontendConfig = 'C:/Users/Azad/AppData/Local/praydog/UEVRInjector_Path_bmd13ubm4lnsejsq5kntwq11ij0xsawc/1.0.0.0/user.config',
+    [string]$Package = 'C:/Users/Azad/Documents/_apps/UEVR/volumetric-frame-prototype-12',
+    [string]$FrontendConfig = 'C:/Users/Azad/AppData/Local/praydog/UEVRInjector_Path_u3t05ixrdp3lpuyui50jns4nnipelbwa/1.0.0.0/user.config',
     [ValidateSet('FluidFlux','DeepRock')][string]$GamePreset = 'FluidFlux',
     [ValidateRange(1,3)][int]$ResolutionScale = 3,
     [ValidateSet(0,1,2)][int]$VirtualDesktopFixOverride = 0,
@@ -9,7 +9,6 @@ param(
     [ValidateRange(1,120)][int]$WarmupSeconds = 10,
     [ValidateRange(1,120)][int]$MeasureSeconds = 20,
     [ValidateRange(0.1,1)][double]$FixedScale = 0.8,
-    [ValidateRange(25,100)][int]$NativePercentage = 75,
     [switch]$CaptureFrames,
     [string]$ModeSequence = 'baseline,crop,reduced,crop,baseline',
     [ValidateRange(30,1800)][int]$TimeoutSeconds = 300
@@ -63,8 +62,8 @@ if (Get-Process -Name FluidFlux,FluidFlux-Win64-Shipping,FSD,FSD-Win64-Shipping,
     throw 'A test game or injector is already running; refusing to disturb it.'
 }
 $segments = @($ModeSequence -split ',' | ForEach-Object { $_.Trim().ToLowerInvariant() })
-if (-not $segments.Count -or ($segments | Where-Object { $_ -notin @('baseline','crop','reduced','fixed','native_scaled') })) {
-    throw 'Modes must be baseline, crop, reduced, fixed, or native_scaled.'
+if (-not $segments.Count -or ($segments | Where-Object { $_ -notin @('baseline','crop','reduced','fixed') })) {
+    throw 'Modes must be baseline, crop, reduced, or fixed.'
 }
 if ($NativeStereoFix -and ($segments | Where-Object { $_ -notin @('baseline','crop') })) {
     throw 'NativeStereoFix supports only baseline and crop modes.'
@@ -145,7 +144,7 @@ try {
     $scaleLua = $FixedScale.ToString('R',[Globalization.CultureInfo]::InvariantCulture)
     $captureLua = if ($CaptureFrames) { 'true' } else { 'false' }
     $nativeLua = if ($NativeStereoFix) { 'true' } else { 'false' }
-    $preamble = "local config = {modes={$modeLua}, warmup_seconds=$WarmupSeconds, measure_seconds=$MeasureSeconds, fixed_scale=$scaleLua, native_percentage=$NativePercentage, native_stereo_fix=$nativeLua, game='$GamePreset', capture_frames=$captureLua}"
+    $preamble = "local config = {modes={$modeLua}, warmup_seconds=$WarmupSeconds, measure_seconds=$MeasureSeconds, fixed_scale=$scaleLua, native_stereo_fix=$nativeLua, game='$GamePreset', capture_frames=$captureLua}"
     $lua = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'frame_benchmark.lua'))
     if (-not $lua.Contains('-- BENCHMARK_CONFIGURATION')) { throw 'Missing Lua configuration marker.' }
     [IO.File]::WriteAllText($scriptPath,$lua.Replace('-- BENCHMARK_CONFIGURATION',$preamble))
@@ -255,7 +254,7 @@ try {
     $summary = [ordered]@{
         passed=$passed; failure=$failure; started=$started.ToString('o'); seconds=$stopwatch.Elapsed.TotalSeconds
         game=$Game; scale=$ResolutionScale; vd_fix=$VirtualDesktopFixOverride; segments=$segments
-        fixed_scale=$FixedScale; native_percentage=$NativePercentage; native_stereo_fix=[bool]$NativeStereoFix; show_engine_stats=[bool]$ShowEngineStats; warmup_seconds=$WarmupSeconds; measure_seconds=$MeasureSeconds
+        fixed_scale=$FixedScale; native_stereo_fix=[bool]$NativeStereoFix; show_engine_stats=[bool]$ShowEngineStats; warmup_seconds=$WarmupSeconds; measure_seconds=$MeasureSeconds
         capture_frames=[bool]$CaptureFrames
         package=$Package; backend_sha256=$backendHash; processes_stopped=$processesStopped
         shutdown_crash_detected=$shutdownCrashDetected
